@@ -11,6 +11,7 @@ from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from attacks.IRTGAttacker import IRTGAttacker
 from attacks.LightWeightCandidateGenerator import LightweightCandidateGenerator
 from attacks.NormalizationAttacker import NormalizationAttacker
+from attacks.PPLStatisticsCollector import PPLStatisticsCollector
 from attacks.RandomAttacker import RandomAttacker
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset import DatasetLoader
@@ -57,7 +58,8 @@ def main(args, config):
     lightweight_generator = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
         analyzer=analyzer,
-        config=config.get('lightweight_candidate', {})
+        config=config.get('lightweight_candidate', {}),
+        llm_client = llm_client,
     )
 
     # 实例化重量级生成器 (LLM) - 注意参数名对齐了 embedder
@@ -118,7 +120,14 @@ def main(args, config):
         label_map_path=run_params.get('label_map'),
         random_seed = run_params.get('random_seed', 42)
     )
+    collector = PPLStatisticsCollector(
+        get_all_vars_fn=get_all_identifiers_fn,
+        mlm_gen=lightweight_generator,
+        llm_gen=heavyweight_generator,
+        config=config
+    )
 
+    # collector.collect(dataset)
     # 执行攻击
     asr_matrix_vrtg = evaluator.attack(dataset)
 

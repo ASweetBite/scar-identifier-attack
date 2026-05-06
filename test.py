@@ -63,7 +63,7 @@ def evaluate_models(test_data_path, model_names):
 
     for name in model_names:
         # 注意确认你的模型路径是否正确，如果是当前目录下的 models 文件夹
-        model_path = f"./models/binary_diversevul_{name.lower()}"
+        model_path = f"./models/binary_diversevul_codebert_pure_dataset"
         if not os.path.exists(model_path):
             print(f"[!] Model {name} not found at {model_path}, skipping.")
             continue

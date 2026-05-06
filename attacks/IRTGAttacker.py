@@ -2,8 +2,9 @@ import gc
 import json
 import math
 import os
+import time
+from typing import List, Dict
 
-import numpy as np
 import torch
 
 from attacks.optimizers import GeneticAlgorithmOptimizer, GreedyOptimizer, BeamSearchOptimizer, BayesianOptimizer
@@ -24,13 +25,23 @@ class IRTGAttacker:
         irtg_config = config.get('irtg_attacker', {})
         hw_config = config.get('heavyweight_candidate', {})
 
-        self.result_dir = _global.get('result_dir',"./results")
+        self.result_dir = _global.get('result_dir', "./results")
         self.top_k = irtg_config.get('top_k', 5)
         self.iterations = run_params.get('iterations', 10)
         self.run_mode = run_params.get('run_mode', 'attack')
 
         self.total_quota = hw_config.get('top_n_keep', 50)
-        self.llm_target_quota = max(1, int(self.total_quota * 0.4))
+        self.llm_target_quota = max(1, int(self.total_quota * 0.5))
+
+        # LLM 相关流程参数：集中配置，避免在 attack() 中写死。
+        self.llm_probe_quota = int(irtg_config.get('llm_probe_quota', run_params.get('llm_probe_quota', 2)))
+        self.max_llm_enrich_attempts = int(
+            irtg_config.get('max_llm_enrich_attempts', run_params.get('max_llm_enrich_attempts', 1))
+        )
+        # 可选：LLM 深度补强后，对目标变量做一次轻量 RNNS 重排。默认关闭，避免额外 query。
+        self.rerank_after_llm_enrich = bool(
+            irtg_config.get('rerank_after_llm_enrich', run_params.get('rerank_after_llm_enrich', False))
+        )
 
         self.optimizer_type = str(run_params.get('algorithm', 'greedy')).lower()
         if self.optimizer_type not in ["greedy", "beam", "ga", "bo"]:
@@ -41,40 +52,43 @@ class IRTGAttacker:
         self.llm_gen = llm_gen
         self.rename_fn = rename_fn
 
+    @staticmethod
+    def _dedup_keep_order(items):
+        """保序去重，避免 list(set(...)) 打乱 LLM 候选词优先级。"""
+        seen = set()
+        result = []
+        for item in items or []:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
+
     def _merge_candidate_pools(self, mlm_pool: dict, llm_pool: dict, final_quota: int = 20) -> dict:
         """
         严格按照优先级合并候选词池：
         1. LLM 生成的高质量词汇享有绝对优先权 (排在最前面)。
         2. MLM 生成的词汇作为 Padding (填充物)，用于补齐 LLM 数量不足的缺口。
-        3. 强制去重并截断至 final_quota。
+        3. 保序去重并截断至 final_quota。
         """
         final_pool = {}
-
-        # 收集所有至少被 MLM 或 LLM 处理过的变量名
-        all_vars = set(mlm_pool.keys()).union(set(llm_pool.keys()))
+        all_vars = self._dedup_keep_order(list(llm_pool.keys()) + list(mlm_pool.keys()))
 
         for var in all_vars:
-            llm_cands = llm_pool.get(var, [])
-            mlm_cands = mlm_pool.get(var, [])
+            llm_cands = self._dedup_keep_order(llm_pool.get(var, []))
+            mlm_cands = self._dedup_keep_order(mlm_pool.get(var, []))
 
-            # Step 1: LLM 候选词作为第一梯队，率先入池
             merged_cands = list(llm_cands)
-
-            # Step 2: 如果 LLM 数量不达标，用 MLM 候选词进行兜底填充
             if len(merged_cands) < final_quota:
                 for cand in mlm_cands:
-                    if cand not in merged_cands:  # 严格去重：防止 MLM 生成了和 LLM 一样的词
+                    if cand not in merged_cands:
                         merged_cands.append(cand)
-                        # 一旦填满所需的配额，立刻停止填充
                         if len(merged_cands) >= final_quota:
                             break
 
-            # Step 3: 严格截断，防止总数溢出 (比如 LLM 自身就生成了超过 final_quota 的词)
             final_pool[var] = merged_cands[:final_quota]
 
         return final_pool
-
-    from typing import List, Dict
 
     def attack(self, dataset: List[Dict]):
         stats = {atk: {vic: {"total": 0, "fooled": 0, "success_queries": []} for vic in self.model_names} for atk in
@@ -82,9 +96,14 @@ class IRTGAttacker:
         storage_orig = {m: [] for m in self.model_names}
         storage_adv = {m: [] for m in self.model_names}
 
-        # 初始化 Ranker (现在它可以利用 MLM 真实扰动)
+        total_valid_sample_time = 0.0
+        valid_sample_count = 0
+        model_time_stats = {m: 0.0 for m in self.model_names}
+        model_valid_counts = {m: 0 for m in self.model_names}
+        shared_prep_time = 0.0
+
+        # 初始化 Ranker 和 Optimizer
         rankers = {m: RNNS_Ranker(self.model_zoo, m, self.rename_fn) for m in self.model_names}
-        # 初始化 Optimizer
         optimizers = {}
         for m in self.model_names:
             opt_kwargs = {"model_zoo": self.model_zoo, "target_model": m, "rename_fn": self.rename_fn,
@@ -99,232 +118,266 @@ class IRTGAttacker:
                 optimizers[m] = BayesianOptimizer(**opt_kwargs)
 
         for idx, sample in enumerate(dataset):
+            t_sample_start = time.time()
+            t_shared_start = time.time()
+
             code = sample["code"]
             ground_truth = sample.get("label")
-
             orig_predictions = {}
+            has_correct_pred = False
+
             for m in self.model_names:
                 probs, pred = self.model_zoo.predict(code, m)
                 orig_predictions[m] = {"probs": probs, "pred": pred}
+                if pred == ground_truth:
+                    has_correct_pred = True
+
+            if not has_correct_pred:
+                print(f"[Sample {idx}] 所有模型初始预测均错误，跳过。")
+                continue
 
             variables = self.get_all_vars_fn(code)
             if not variables: continue
 
-            # =====================================================================
-            # 优化点 1: 引入 AST 折叠逻辑，大幅缩减无效上下文
-            # =====================================================================
             code_bytes = code.encode("utf-8")
-            analyzer = self.mlm_gen.analyzer  # 直接复用生成器中的 analyzer
-            identifiers = analyzer.extract_identifiers(code_bytes)
+            analyzer = self.mlm_gen.analyzer
 
+            # === AST 解析 ===
+            t_ast_start = time.time()
+            full_identifiers = analyzer.extract_identifiers(code_bytes)
             batch_tasks = []
 
-            # print(f"\n[Sample {idx + 1}] Target Pool Size: {len(variables)} identifiers")
-            # print("=" * 50)
-            # print("🔍 AST FOLDED CODE SLICES (VARIABLES ONLY)")
-            # print("=" * 50)
-
             for var in variables:
-                # 如果 AST 没有提取到该标识符（极为罕见的 Parser 偏差），直接用全量代码兜底
-                if var not in identifiers:
-                    batch_tasks.append({"target_name": var, "code_str": code})
-                    continue
-
-                # 【核心逻辑】：判断当前标识符是否是纯函数名或类名
-                # 如果它所有的使用场景都是 function/method/class，那它就不是普通变量
+                if var not in full_identifiers: continue
                 is_callable_or_class = all(
-                    occ.get("entity_type") in ["function", "method", "class"] for occ in identifiers[var])
+                    occ.get("entity_type") in ["function", "method", "class"] for occ in full_identifiers[var])
 
                 if is_callable_or_class:
-                    # 【修改点】：不对函数名做切片，直接传入完整代码作为上下文
                     target_code_str = code
-                    # print(f"\n--- ⚡ Skipped Slicing for Function/Class: '{var}' ---")
                 else:
                     try:
-                        # 仅对真正的普通变量执行折叠切片
                         target_code_str = analyzer.get_folded_code(code_bytes, var)
-                        # print(f"\n--- ✂️ Slice for Target Variable: '{var}' ---")
-                        # print(target_code_str)
-                    except Exception as e:
-                        target_code_str = code  # 降级兜底
-                        # print(f"\n--- ⚠️ Slicing Failed for '{var}', using full code ---")
+                    except Exception:
+                        target_code_str = code
 
-                batch_tasks.append({"target_name": var, "code_str": target_code_str})
-                # print("-" * 50)
+                batch_tasks.append({
+                    "target_name": var,
+                    "code_str": target_code_str,
+                    "full_code_str": code,
+                    "full_identifiers": full_identifiers
+                })
 
-            # print(f"\n[Sample {idx + 1}] Target Pool Size: {len(variables)} variables")
+            print(f"    [Time] AST Folding & Setup took {time.time() - t_ast_start:.2f}s")
 
-            # =====================================================================
-            # 优化点 2: 引入分块生成 (Chunking) 彻底解决 MLM OOM 问题
-            # =====================================================================
-            print(f" -> Running MLM Lightweight Generator (Target: {self.total_quota} cands/var)...")
-            mlm_subs_pool = {}
+            # 1. 预选阶段 - 全局 MLM 满载生成 (天然复用)
+            print(f" -> Running FULL MLM Generation (Target: {self.total_quota} cands/var for ALL vars)...")
+            t_mlm_start = time.time()
+            mlm_full_pool = {}
             MAX_BATCH_SIZE = 4
-            num_chunks = math.ceil(len(batch_tasks) / MAX_BATCH_SIZE)
 
             for i in range(0, len(batch_tasks), MAX_BATCH_SIZE):
                 chunk = batch_tasks[i:i + MAX_BATCH_SIZE]
                 try:
-                    # [关键点] MLM 直接瞄准 total_quota (例如50) 进行满额生成，作为保底底座
                     chunk_pool = self.mlm_gen.generate_candidates(
-                        chunk,
-                        top_k_mlm=max(40, self.total_quota),  # 确保搜索空间足够大
-                        top_n_keep=self.total_quota
+                        chunk, top_k_mlm=max(40, self.total_quota + 10), top_n_keep=self.total_quota,
                     )
-                    mlm_subs_pool.update(chunk_pool)
+                    mlm_full_pool.update(chunk_pool)
                 finally:
                     gc.collect()
                     if torch.cuda.is_available(): torch.cuda.empty_cache()
+            print(f"    [Time] Global MLM Generation took {time.time() - t_mlm_start:.2f}s")
 
-            # 剔除未成功生成 MLM 候选词的变量
-            variables = [v for v in variables if mlm_subs_pool.get(v)]
+            variables = [v for v in variables if mlm_full_pool.get(v)]
             if not variables: continue
 
-            # =====================================================================
-            # [新增架构] 优化点 2.5: LLM 全局语义探针注入 (Proxy Semantic Probe)
-            # =====================================================================
-            print(f" -> Running LLM Semantic Probe (Target: 2 cands/var for ALL vars)...")
-            probe_quota = 2
+            # === 初始化当前样本的 LLM 全局缓存 ===
+            # 结构: { variable_name: [candidate_1, candidate_2, ...] }
+            # 注意：候选词顺序代表质量优先级，因此必须保序去重。
+            batch_tasks_by_var = {task["target_name"]: task for task in batch_tasks}
+            sample_llm_cache = {v: [] for v in variables}
+            deep_enrich_attempts = {v: 0 for v in variables}
+
+            # 2. LLM 浅层探针 (Probe)
+            llm_probe_quota = self.llm_probe_quota
+            print(f" -> Running LLM Shallow Probe (Target: {llm_probe_quota} cands/var)...")
+            t_probe_start = time.time()
             try:
-                # 针对所有有效变量，利用 1.5B 本地模型生成极少量的探针词汇
-                llm_probe_pool = self.llm_gen.generate_candidates(
-                    batch_tasks,
-                    target_quota=probe_quota
-                )
+                llm_probe_pool = self.llm_gen.generate_candidates(batch_tasks, target_quota=llm_probe_quota)
+                # 存入缓存：保序去重，不能使用 list(set(...))。
+                for var, cands in llm_probe_pool.items():
+                    if var in sample_llm_cache:
+                        sample_llm_cache[var] = self._dedup_keep_order(cands)
             finally:
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
+            print(f"    [Time] LLM Probe Generation took {time.time() - t_probe_start:.2f}s")
 
-            # 构建带有探针的混合池，专门用于破除 RNNS 的观测偏差
-            rnns_eval_pool = self._merge_candidate_pools(
-                mlm_pool=mlm_subs_pool,
-                llm_pool=llm_probe_pool,
-                final_quota=self.total_quota
-            )
+            # 合并探测池用于 RNNS 分析
+            rnns_eval_pool = self._merge_candidate_pools(mlm_full_pool, sample_llm_cache, final_quota=self.total_quota)
 
+            current_shared_time = time.time() - t_shared_start
+            sample_attacked_by_any = False
+
+            # =====================================================================
+            # 模型独立攻击循环
+            # =====================================================================
             for atk_model in self.model_names:
+                t_atk_model_start = time.time()
+
                 orig_pred = orig_predictions[atk_model]["pred"]
-                print(f"[{atk_model}] Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)")
+                if orig_pred != ground_truth:
+                    print(f"[{atk_model}] 初始预测错误，跳过该模型攻击流程。")
+                    continue
+
+                print(f"\n[{atk_model}] Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)")
                 stats[atk_model][atk_model]["total"] += 1
-
                 rnns_best_seed = None
-
-                # 2. 对于所有的算法，都用包含探针的混合池进行靶向定位
                 self.model_zoo.reset_counter()
 
+                # 1. RNNS 显著性分析
                 print(" -> Running RNNS Saliency Analysis...")
+                t_rnns_start = time.time()
                 top_k = max(self.top_k, int(len(variables) * 0.5))
-                # 这里的查询会被 Tracker 自动记录
                 rnns_output = rankers[atk_model].rank_variables(
-                    code=code, variables=variables.copy(),
-                    subs_pool=rnns_eval_pool, # [修改点] 传入注入了探针的池子
-                    reference_label=orig_pred, top_k = top_k
+                    code=code, variables=variables.copy(), subs_pool=rnns_eval_pool,
+                    reference_label=orig_pred, top_k=top_k
                 )
 
                 if len(rnns_output) == 3:
                     ranked_vars, all_scores, rnns_best_seed = rnns_output
                 else:
                     ranked_vars, all_scores = rnns_output
+                print(f"    [Time] RNNS Analysis took {time.time() - t_rnns_start:.2f}s")
 
-                    # 1. 决定【优化器】能看见的搜索空间 (保持你的 Beam Search 无硬截断逻辑)
                 if self.optimizer_type in ["greedy", "beam"]:
                     target_vars = ranked_vars
                 else:
                     target_vars = ranked_vars[:top_k]
-
                 target_scores = {var: all_scores[var] for var in target_vars}
 
-                # =====================================================================
-                # 优化点 3: 算力护城河 —— 严格只为 Top-K 脆弱变量补齐 LLM 候选词
-                # =====================================================================
-                remaining_quota = self.llm_target_quota
+                t_enrich_start = time.time()
+                tasks_to_generate = []
 
-                # 【核心修复】：无论什么优化算法，需要重度调用 LLM 的变量永远被死死限制在 Top-K！
-                llm_enrichment_vars = ranked_vars[:top_k]
+                for var in target_vars:
+                    task = batch_tasks_by_var.get(var)
+                    if not task:
+                        continue
+
+                    cached_cands = sample_llm_cache.get(var, [])
+                    attempts = deep_enrich_attempts.get(var, 0)
+                    if len(cached_cands) < self.llm_target_quota and attempts < self.max_llm_enrich_attempts:
+                        tasks_to_generate.append(task)
+
+                deep_enriched_this_round = False
+                if tasks_to_generate:
+                    print(
+                        f" -> Cache Miss! Running LLM Deep Enrichment for {len(tasks_to_generate)} target vars...")
+                    missed_vars = [t['target_name'] for t in tasks_to_generate]
+                    print(f"    [Info] Variables sent to LLM: {missed_vars}")
+
+                    try:
+                        new_llm_pool = self.llm_gen.generate_candidates(
+                            tasks_to_generate, target_quota=self.llm_target_quota
+                        )
+
+                        for var in missed_vars:
+                            deep_enrich_attempts[var] = deep_enrich_attempts.get(var, 0) + 1
+
+                        # 将新生成的词合并到全局缓存中：保序去重，保留 LLM 输出质量顺序。
+                        for var, cands in new_llm_pool.items():
+                            old_cands = sample_llm_cache.get(var, [])
+                            merged = self._dedup_keep_order(old_cands + list(cands or []))
+                            if len(merged) > len(old_cands):
+                                deep_enriched_this_round = True
+                            sample_llm_cache[var] = merged
+                    finally:
+                        gc.collect()
+                        if torch.cuda.is_available(): torch.cuda.empty_cache()
+                else:
+                    print(
+                        " -> Cache Hit! All target variables have sufficient LLM candidates or reached max attempts.")
 
                 print(
-                    f" -> LLM Generating remaining candidates for Top-{len(llm_enrichment_vars)} vars (Target: {remaining_quota} cands/var)...")
+                    f"    [Time] Target Enrichment (Cache Check & Generation) took {time.time() - t_enrich_start:.2f}s")
 
-                # 依据 llm_enrichment_vars 过滤任务，而不是 target_vars
-                vulnerable_tasks = [t for t in batch_tasks if t["target_name"] in llm_enrichment_vars]
+                # 构建当前模型的最终候选池 (满载 MLM + 缓存 LLM)
+                final_subs_pool = self._merge_candidate_pools(mlm_full_pool, sample_llm_cache, self.total_quota)
 
-                try:
-                    # 只有真正脆弱的 Top-K 变量，才会享受这昂贵的算力
-                    llm_main_pool = self.llm_gen.generate_candidates(
-                        vulnerable_tasks,
-                        target_quota=remaining_quota
+                # 可选：LLM 深度补强后用最终候选池对目标变量做轻量重排，避免 RNNS 只看浅层 probe。
+                if self.rerank_after_llm_enrich and deep_enriched_this_round and target_vars:
+                    print(" -> Re-running lightweight RNNS after LLM enrichment...")
+                    t_rerank_start = time.time()
+                    rerank_vars = target_vars[:top_k] if len(target_vars) > top_k else target_vars
+                    rerank_output = rankers[atk_model].rank_variables(
+                        code=code,
+                        variables=rerank_vars.copy(),
+                        subs_pool=final_subs_pool,
+                        reference_label=orig_pred,
+                        top_k=len(rerank_vars)
                     )
-                finally:
-                    gc.collect()
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                    if len(rerank_output) == 3:
+                        target_vars, rerank_scores, rnns_best_seed = rerank_output
+                    else:
+                        target_vars, rerank_scores = rerank_output
+                    target_scores = {var: rerank_scores.get(var, all_scores.get(var, 0.0)) for var in target_vars}
+                    print(f"    [Time] RNNS Re-rank took {time.time() - t_rerank_start:.2f}s")
 
-                # 合并探针词汇与新生成的补齐词汇，构成最终的 LLM 弹药库
-                final_llm_pool = {}
-                for var in variables:
-                    # 安全合并：如果 var 不在 Top-K 里，llm_main_pool.get(var) 会是空列表
-                    # 但它依然能保留最初轻量级生成的 2 个探针词汇
-                    final_llm_pool[var] = list(set(llm_probe_pool.get(var, []) + llm_main_pool.get(var, [])))
-
-                # =====================================================================
-                # Phase 4: 弹药库融合 (优先级 Padding)
-                # =====================================================================
-                # [关键点] 把总配额传给合并函数
-                final_subs_pool = self._merge_candidate_pools(
-                    mlm_pool=mlm_subs_pool,
-                    llm_pool=final_llm_pool, # [修改点] 传入合并后的完整 LLM 词汇池
-                    final_quota=self.total_quota
-                )
-
+                # 2. 优化器执行
                 print(" -> Attack execution started...")
+                t_opt_start = time.time()
                 run_kwargs = {
                     "code": code, "original_pred": orig_pred,
                     "target_vars": target_vars, "subs_pool": final_subs_pool,
                     "variable_scores": target_scores
                 }
                 if self.optimizer_type == "ga":
-                    if rnns_best_seed:
-                        run_kwargs["rnns_best_seed"] = rnns_best_seed
+                    if rnns_best_seed: run_kwargs["rnns_best_seed"] = rnns_best_seed
                     run_kwargs["all_vars"] = ranked_vars
                     run_kwargs["variable_scores"] = all_scores
                 if self.optimizer_type == "bo":
                     run_kwargs["rnns_best_seed"] = rnns_best_seed
+                if self.optimizer_type == "beam":
+                    # 传入 analyzer，使 Beam 能在组合替换过程中重新做 AST 合法性校验。
+                    run_kwargs["analyzer"] = analyzer
 
-                # 优化器的查询同样会被 Tracker 自动记录
                 is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(**run_kwargs)
+                print(f"    [Time] Optimizer ({self.optimizer_type.upper()}) Run took {time.time() - t_opt_start:.2f}s")
 
+                # 状态与耗时落盘
                 queries_consumed = self.model_zoo.get_query_count()
-
-                if self.run_mode == "dataset":
-                    storage_orig[atk_model].append({"func": code, "label": ground_truth})
-                    storage_adv[atk_model].append({"func": adv_code, "label": ground_truth})
-                    if is_success:
-                        stats[atk_model][atk_model]["fooled"] += 1
-                        stats[atk_model][atk_model]["success_queries"].append(queries_consumed)
-                        print(f"    ✅ Success | Queries: {queries_consumed}")
-                    else:
-                        print(f"    ❌ Failed | Queries: {queries_consumed}")
-                else:
-                    if is_success:
-                        stats[atk_model][atk_model]["fooled"] += 1
-                        stats[atk_model][atk_model]["success_queries"].append(queries_consumed)
-                        storage_adv[atk_model].append(
-                            {"original_code": code, "adversarial_code": adv_code, "label": ground_truth})
-                        print(f"    ✅ Success | {orig_pred} -> {adv_pred} | Queries: {queries_consumed}")
-                    else:
-                        print(f"    ❌ Failed | Queries: {queries_consumed}")
-
                 if is_success:
+                    stats[atk_model][atk_model]["fooled"] += 1
+                    stats[atk_model][atk_model]["success_queries"].append(queries_consumed)
+                    storage_adv[atk_model].append(
+                        {"original_code": code, "adversarial_code": adv_code, "label": ground_truth})
+                    print(f"    ✅ Success | {orig_pred} -> {adv_pred} | Queries: {queries_consumed}")
+
+                    # 迁移攻击评估...
                     for vic_model in self.model_names:
                         if vic_model == atk_model: continue
-                        vic_orig_pred = orig_predictions[vic_model]["pred"]
-                        if vic_orig_pred == ground_truth:
+                        if orig_predictions[vic_model]["pred"] == ground_truth:
                             stats[atk_model][vic_model]["total"] += 1
                             _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
-                            if vic_adv_pred != vic_orig_pred:
+                            if vic_adv_pred != orig_predictions[vic_model]["pred"]:
                                 stats[atk_model][vic_model]["fooled"] += 1
-                                print(f"      [Transfer] ✅ {vic_model} FOOLED")
+                else:
+                    print(f"    ❌ Failed | Queries: {queries_consumed}")
 
-        # self.print_summary(stats)
+                model_elapsed = time.time() - t_atk_model_start
+                model_time_stats[atk_model] += model_elapsed
+                model_valid_counts[atk_model] += 1
+                sample_attacked_by_any = True
+
+                print(f"    [Time] Total processing time for model '{atk_model}': {model_elapsed:.2f}s")
+
+            sample_elapsed = time.time() - t_sample_start
+            if sample_attacked_by_any:
+                total_valid_sample_time += sample_elapsed
+                valid_sample_count += 1
+                shared_prep_time += current_shared_time
+
+            print("-" * 50)
+            print(f"\n[Time] Total elapsed time for Sample {idx}: {sample_elapsed:.2f}s\n" + "-" * 50)
         print("\n" + "=" * 50)
         print("🎯 FINAL ATTACK SUMMARY")
         print("=" * 50)
@@ -332,8 +385,7 @@ class IRTGAttacker:
         avg_queries = {}
         for atk_m in self.model_names:
             asr_matrix[atk_m] = {}
-
-            # 计算白盒/自身攻击的 AvgQ (学术界通用指标)
+            import numpy as np
             success_queries = stats[atk_m][atk_m]["success_queries"]
             avg_q = round(np.mean(success_queries), 2) if success_queries else 0.0
             avg_queries[atk_m] = avg_q
@@ -347,16 +399,35 @@ class IRTGAttacker:
             print(f"   ► Avg. Queries (Success)    : {avg_q}")
             print("-" * 50)
 
-            # 计算可迁移性 (Transferability)
             for vic_m in self.model_names:
                 total = stats[atk_m][vic_m]["total"]
                 fooled = stats[atk_m][vic_m]["fooled"]
                 asr = (fooled / total * 100) if total > 0 else 0.0
                 asr_matrix[atk_m][vic_m] = round(asr, 2)
 
+        # === 修改 4：按模型分列显示的精确时间统计面板 ===
+        print("\n" + "=" * 50)
+        print("⏱️ TIME STATISTICS (Valid Samples Only)")
+        print("=" * 50)
+        avg_sample_time = (total_valid_sample_time / valid_sample_count) if valid_sample_count > 0 else 0.0
+        avg_shared_time = (shared_prep_time / valid_sample_count) if valid_sample_count > 0 else 0.0
+
+        print(f"   ► Valid Attacked Samples    : {valid_sample_count}")
+        print(f"   ► Avg. Total Time / Sample  : {avg_sample_time:.2f}s")
+        print(f"   ► Avg. Shared Prep Time     : {avg_shared_time:.2f}s (AST, Global MLM, LLM Probe)")
+        print("-" * 50)
+        print("   [Breakdown by Target Model (RNNS + LLM Enrich + Optimizer)]")
+
+        for m in self.model_names:
+            m_count = model_valid_counts[m]
+            avg_m_time = (model_time_stats[m] / m_count) if m_count > 0 else 0.0
+            print(f"     * {m.upper():<12} | Valid attacks: {m_count:<3} | Avg Time: {avg_m_time:.2f}s")
+
+        print("=" * 50)
         self.save_results(storage_orig, storage_adv)
 
         return asr_matrix, avg_queries
+
 
     def save_results(self, storage_orig, storage_adv):
         """Saves original and adversarial samples to JSON files based on the configured result directory."""

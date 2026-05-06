@@ -337,7 +337,7 @@ class GreedyOptimizer:
 
 
 import math
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict, Tuple, Any
 
 
 class BeamSearchOptimizer:
@@ -348,44 +348,134 @@ class BeamSearchOptimizer:
         self.mode = mode
 
         run_cfg = config.get('run_params', {}) if config else {}
+        beam_cfg = config.get('beam_params', {}) if config else {}
         self.run_mode = run_cfg.get('run_mode', 'attack')
 
-        self.beam_size = run_cfg.get('beam_size', 3)
-        # 1. 取消了硬截断 max_vars
-        # 2. 分块大小：每次取 N 个候选词进行 GPU 批处理，控制查询粒度
-        self.cand_chunk_size = run_cfg.get('cand_chunk_size', 10)
-        # 3. 局部早停阈值：用于在 LLM 已经取得显著效果时，跳过后续的 MLM 兜底词汇
-        self.early_stop_delta = run_cfg.get('early_stop_delta', 0.3)
+        self.beam_size = beam_cfg.get('beam_size', 3)
+        self.cand_chunk_size = beam_cfg.get('cand_chunk_size', 10)
+
+        # ==========================================================
+        # Beam 早停策略：可配置
+        #   none/disabled/off/false : 不早停，遍历当前变量全部候选
+        #   dynamic                 : 保留原逻辑：候选 chunk 有显著提升且变量数充足才早停
+        #   gain                    : 只要候选 chunk 有显著提升就早停
+        #   patience                : 连续若干 chunk 没有显著提升才早停
+        # ==========================================================
+        self.early_stop_delta = beam_cfg.get('early_stop_delta', 0.3)
+        self.early_stop_strategy = str(
+            beam_cfg.get('beam_early_stop_strategy', beam_cfg.get('early_stop_strategy', 'dynamic'))
+        ).lower()
+        self.early_stop_patience = int(beam_cfg.get('beam_early_stop_patience', 2))
+        self.early_stop_min_valid_vars = int(beam_cfg.get('beam_early_stop_min_valid_vars', 3))
+
+        # ==========================================================
+        # AST 合法性校验：默认开启。
+        # 需要在 run(...) 中传入 analyzer；如果没有传入 analyzer，自动降级为只依赖 rename_fn。
+        # ==========================================================
+        self.enable_ast_check = bool(beam_cfg.get('beam_enable_ast_check', True))
+        self._warned_missing_analyzer = False
 
     def _calculate_fitness(self, probs: List[float], original_pred: int) -> float:
+        """
+        计算适应度 (Fitness): 评估替换词对模型置信度的破坏程度。
+        返回值越大，说明该替换词的攻击潜力越高。
+        """
         orig_idx = 0 if original_pred == -1 else original_pred
         orig_idx = min(orig_idx, len(probs) - 1)
         orig_prob = max(probs[orig_idx], 1e-9)
 
         if self.mode == "binary":
-            target_idx = 1 if original_pred == -1 else 0
+            target_idx = 1 if orig_idx == 0 else 0
             target_idx = min(target_idx, len(probs) - 1)
             target_prob = max(probs[target_idx], 1e-9)
             return math.log(target_prob) - math.log(orig_prob)
-        else:
-            return -orig_prob
+
+        # 多分类 Margin Loss：防止概率扩散。
+        other_probs = [p for i, p in enumerate(probs) if i != orig_idx]
+        max_other_prob = max(other_probs) if other_probs else 1e-9
+        max_other_prob = max(max_other_prob, 1e-9)
+        return math.log(max_other_prob) - math.log(orig_prob)
+
+    def _dedup_keep_order(self, items: List[str]) -> List[str]:
+        seen = set()
+        result = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result
+
+    def _is_ast_legal_rename(self, curr_code: str, var: str, cand: str, analyzer: Any = None) -> bool:
+        """
+        在当前 beam 状态 curr_code 上校验 var -> cand 是否仍然 AST 合法。
+        注意：候选生成阶段的合法性是在原始代码上验证的；Beam 组合替换后仍可能产生新冲突，
+        所以这里必须基于 curr_code 重新解析。
+        """
+        if not self.enable_ast_check:
+            return True
+
+        if analyzer is None:
+            if not self._warned_missing_analyzer:
+                print("    [Warn] Beam AST check enabled but analyzer is None; fallback to rename_fn only.")
+                self._warned_missing_analyzer = True
+            return True
+
+        try:
+            code_bytes = curr_code.encode("utf-8")
+            identifiers = analyzer.extract_identifiers(code_bytes)
+
+            if var not in identifiers:
+                return False
+            if not analyzer.can_rename_to(code_bytes, var, cand):
+                return False
+
+            from utils.ast_tools import CodeTransformer
+            CodeTransformer.validate_and_apply(
+                code_bytes,
+                identifiers,
+                {var: cand},
+                analyzer=analyzer,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _should_stop_after_chunk(self, chunk_best_fitness_gain: float, valid_var_count: int,
+                                 bad_chunk_count: int) -> bool:
+        strategy = self.early_stop_strategy
+
+        if strategy in {"none", "disabled", "disable", "off", "false", "0"}:
+            return False
+
+        if strategy == "gain":
+            return chunk_best_fitness_gain >= self.early_stop_delta
+
+        if strategy == "patience":
+            if valid_var_count < self.early_stop_min_valid_vars:
+                return False
+            return bad_chunk_count >= self.early_stop_patience
+
+        # 默认 dynamic：兼容你原来的“有明显提升就停，但变量数太少时不停”。
+        if valid_var_count >= self.early_stop_min_valid_vars:
+            return chunk_best_fitness_gain >= self.early_stop_delta
+        return False
 
     def run(self, code: str, original_pred: int, target_vars: List[str], subs_pool: Dict[str, List[str]],
-            variable_scores: Dict[str, float] = None):
-        # ==========================================
-        # 核心保证 1: 变量级优先级排序 (优先查高分变量)
-        # ==========================================
+            variable_scores: Dict[str, float] = None, analyzer: Any = None):
+
         if variable_scores:
-            # 严格按照 RNNS 显著性得分降序排列，确保最脆弱的变量最先被替换
             sorted_vars = sorted(target_vars, key=lambda v: variable_scores.get(v, 0), reverse=True)
         else:
             sorted_vars = target_vars
 
-        # [修改点] 移除硬截断：sorted_vars = sorted_vars[:self.max_vars]
-
         query_cache = {}
 
         def _get_predictions(codes_to_predict: List[str]) -> Tuple[List[List[float]], List[int]]:
+            if not codes_to_predict:
+                return [], []
+
+            codes_to_predict = self._dedup_keep_order(codes_to_predict)
             uncached_codes = [c for c in codes_to_predict if c not in query_cache]
 
             if uncached_codes:
@@ -396,9 +486,9 @@ class BeamSearchOptimizer:
             cached_results = [query_cache[c] for c in codes_to_predict]
             probs_list = [res[0] for res in cached_results]
             preds_list = [res[1] for res in cached_results]
-
             return probs_list, preds_list
 
+        # 基线预测。
         init_probs, init_preds = _get_predictions([code])
         orig_probs = init_probs[0]
         orig_pred = init_preds[0]
@@ -409,9 +499,11 @@ class BeamSearchOptimizer:
         overall_best_fitness = initial_fitness
         overall_best_code = code
 
-        # 遍历所有变量（无截断），但因为按 RNNS 排序了，成功大概率发生在前面几次循环
+        # 记录当前样本可用的有效变量数量。
+        valid_var_count = len([v for v in sorted_vars if subs_pool.get(v, [])])
+
         for var in sorted_vars:
-            candidates = subs_pool.get(var, [])
+            candidates = self._dedup_keep_order(subs_pool.get(var, []))
             if not candidates:
                 continue
 
@@ -419,11 +511,8 @@ class BeamSearchOptimizer:
 
             for curr_fitness, curr_code, curr_probs, curr_pred in beam:
                 new_beam_candidates.append((curr_fitness, curr_code, curr_probs, curr_pred))
+                bad_chunk_count = 0
 
-                # ==========================================
-                # 核心保证 2: 候选词级的分块与优先级
-                # ==========================================
-                # 按照 cand_chunk_size (例如10) 分块查询，而不是一次查50个
                 for i in range(0, len(candidates), self.cand_chunk_size):
                     cand_chunk = candidates[i:i + self.cand_chunk_size]
 
@@ -431,14 +520,24 @@ class BeamSearchOptimizer:
                     for cand in cand_chunk:
                         if cand == var:
                             continue
+
+                        # 关键新增：在当前 beam 代码状态上做 AST 合法性校验。
+                        if not self._is_ast_legal_rename(curr_code, var, cand, analyzer=analyzer):
+                            continue
+
                         try:
                             temp_code = self.rename_fn(curr_code, {var: cand})
-                            if temp_code:
+                            if temp_code and temp_code != curr_code:
                                 codes_to_predict.append(temp_code)
                         except Exception:
                             continue
 
                     if not codes_to_predict:
+                        # 当前 chunk 全部非法时，也算一个无收益 chunk，供 patience 策略使用。
+                        if self.early_stop_strategy == "patience":
+                            bad_chunk_count += 1
+                            if self._should_stop_after_chunk(0.0, valid_var_count, bad_chunk_count):
+                                break
                         continue
 
                     batch_probs, batch_preds = _get_predictions(codes_to_predict)
@@ -455,10 +554,7 @@ class BeamSearchOptimizer:
                             overall_best_fitness = fitness
                             overall_best_code = temp_code
 
-                        # ==========================================
-                        # 核心保证 3: 发现即熔断 (Global Early Return)
-                        # ==========================================
-                        # 一旦在这个分块中发现了导致模型翻转的样本，立刻停止整个搜索流程并返回
+                        # 全局熔断：发现翻转立即停止攻击并返回。
                         if pred != original_pred and self.run_mode == "attack":
                             verify_probs, verify_preds = _get_predictions([temp_code])
                             if verify_preds[0] != original_pred:
@@ -466,13 +562,19 @@ class BeamSearchOptimizer:
 
                         new_beam_candidates.append((fitness, temp_code, probs, pred))
 
-                    # 局部早停：如果当前 Chunk (通常是 LLM 的词) 已经让适应度提升了 early_stop_delta
-                    # 则不必再查后续的 Chunk (通常是 MLM 的兜底词)
-                    if chunk_best_fitness_gain >= self.early_stop_delta:
+                    # 可配置早停策略。
+                    if self.early_stop_strategy == "patience":
+                        if chunk_best_fitness_gain < self.early_stop_delta:
+                            bad_chunk_count += 1
+                        else:
+                            bad_chunk_count = 0
+
+                    if self._should_stop_after_chunk(chunk_best_fitness_gain, valid_var_count, bad_chunk_count):
                         break
 
             unique_candidates = {}
             for state in new_beam_candidates:
+                # 去重逻辑：保留相同代码下 fitness 最高的状态。
                 if state[1] not in unique_candidates or state[0] > unique_candidates[state[1]][0]:
                     unique_candidates[state[1]] = state
 
@@ -484,8 +586,8 @@ class BeamSearchOptimizer:
         final_pred = final_preds_list[0]
 
         is_success = (final_pred != original_pred)
-
         return is_success, overall_best_code, final_probs, final_pred
+
 
 
 class BayesianOptimizer:

@@ -520,8 +520,8 @@ def apply_boolean_expansion(source):
 
 def obfuscate(code):
     # 增加硬性熔断：超过 8000 字符的怪物级代码直接返回，不参与混淆
-    if len(code) > 8000:
-        return code
+    # if len(code) > 8000:
+    #     return code
 
     transformations = [
         apply_splitting,
@@ -535,7 +535,7 @@ def obfuscate(code):
     ]
 
     # 每次随机抽 2 到 4 个变换进行组合（避免套娃太多层导致语法彻底崩溃）
-    num = random.randint(2, min(4, len(transformations)))
+    num = random.randint(3, min(5, len(transformations)))
     selected_indices = sorted(random.sample(range(len(transformations)), num))
 
     for idx in selected_indices:

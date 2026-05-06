@@ -1,39 +1,167 @@
-import re
 import itertools
+import math
+import re
+from typing import Dict, Any
+from typing import List
+
 import torch
 import torch.nn.functional as F
-from typing import List, Dict, Any
 
 
 class LightweightCandidateGenerator:
-    def __init__(self, mlm_engine, analyzer, config):
+    def __init__(self, mlm_engine, analyzer, config, llm_client=None):
         """
-        初始化轻量级生成器（仅依赖 MLM，用作快速探针与初步攻击空间构建）
+        初始化轻量级生成器（依赖 MLM 进行掩码预测，同时引入 LLM 进行 PPL 自然度评估）
         :param mlm_engine: 用于掩码预测、提取 Token Embedding 和计算相似度的模型
         :param analyzer: 语法树与上下文分析器
         :param config: 全局配置字典
+        :param llm_client: [新增] 传入 Qwen LLM 客户端，复用其计算 PPL (困惑度)
         """
         self.mlm_engine = mlm_engine
         self.analyzer = analyzer
         self.config = config
+        self.llm_client = llm_client  # 保存 LLM 句柄用于 PPL 计算
         stats_path = config.get('naming_stats_path', 'naming_stats.json')
 
         from utils.scorer import StatisticalNamingScorer
         self.scorer = StatisticalNamingScorer(stats_path)
 
+    @torch.no_grad()
+    def _calculate_perplexity_batch(self, texts: List[str], batch_size: int = 4) -> List[float]:
+        """批量计算 PPL，避免闲置 GPU 算力"""
+        if not texts or not self.llm_client:
+            return [0.0] * len(texts)
+
+        tokenizer = getattr(self.llm_client, 'tokenizer', None)
+        model = getattr(self.llm_client, 'model', None)
+        if not tokenizer or not model: return [0.0] * len(texts)
+
+        device = model.device
+        ppls = []
+
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            inputs = tokenizer(
+                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024
+            ).to(device)
+
+            outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = inputs["input_ids"][..., 1:].contiguous()
+            shift_mask = inputs["attention_mask"][..., 1:].contiguous()
+
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss.view(shift_labels.size(0), shift_labels.size(1)) * shift_mask
+
+            seq_lens = torch.clamp(shift_mask.sum(dim=1), min=1.0)
+            seq_loss = loss.sum(dim=1) / seq_lens
+
+            for val in seq_loss:
+                try:
+                    ppls.append(math.exp(val.item()))
+                except OverflowError:
+                    ppls.append(float('inf'))
+
+            del inputs, outputs, loss
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+        return ppls
+
+    def _get_dynamic_threshold(self, target_name: str, cand: str, base_threshold: float) -> float:
+        target_lower = target_name.lower()
+        cand_lower = cand.lower()
+
+        # 1. 纯前缀/后缀附加
+        if cand_lower.endswith(f"_{target_lower}") or cand_lower.startswith(f"{target_lower}_"):
+            return min(0.98, base_threshold + 0.05)
+
+        # 2. 词根完全包含但没有分隔符
+        if target_lower in cand_lower:
+            return min(0.98, base_threshold + 0.03)
+
+        # 3. 极小编辑距离
+        import Levenshtein
+        if Levenshtein.distance(target_lower, cand_lower) <= 2:
+            return min(0.98, base_threshold + 0.07)
+
+        # ==========================================================
+        # 4. [终极版] 多词根局部微调：引入基于长度的重叠率惩罚
+        # ==========================================================
+        target_parts, target_sep = self._split_identifier(target_name)
+        cand_parts, cand_sep = self._split_identifier(cand)
+
+        if len(target_parts) > 1 and len(target_parts) == len(cand_parts) and target_sep == cand_sep:
+            identical_count = sum(1 for t, c in zip(target_parts, cand_parts) if t.lower() == c.lower())
+
+            if identical_count > 0:
+                # 计算重叠率 (例如 4/5 = 0.8)
+                overlap_ratio = identical_count / len(target_parts)
+
+                # 只有当重叠率超过一半时，才触发高度惩罚
+                if overlap_ratio >= 0.5:
+                    # 惩罚公式：基础惩罚 + (重叠率的缩放)
+                    # 重叠率越高，惩罚越重
+                    base_penalty = 0.02
+                    ratio_penalty = overlap_ratio * 0.06  # 最高可贡献 0.06 的惩罚
+                    penalty = base_penalty + ratio_penalty
+
+                    # 尾部词根替换额外惩罚（核心名词替换）
+                    if target_parts[-1].lower() != cand_parts[-1].lower():
+                        penalty += 0.015
+
+                    return min(0.98, base_threshold + penalty)
+
+        # 5. 完全替换 / 无明显结构对齐
+        return base_threshold
+
+    def _get_mutation_pattern(self, target_name: str, cand_name: str) -> str:
+        """
+        提取变异模式。
+        对于结构完全改变、单字母替换、或无重叠部分的候选词，返回 '*'，这些词永远不被信任。
+        只有保留了部分结构的局部替换（如 'sys_ue' -> 'mem_ue' = '*_ue'）才返回特定模式。
+        """
+        t_parts, t_sep = self._split_identifier(target_name)
+        c_parts, c_sep = self._split_identifier(cand_name)
+
+        # 仅当：1. 词根数量相同 2. 拼接符相同 3. 原词不仅包含一个词根
+        if len(t_parts) == len(c_parts) and t_sep == c_sep and len(t_parts) > 1:
+            pattern = []
+            identical_count = 0
+            for t, c in zip(t_parts, c_parts):
+                if t.lower() == c.lower():
+                    pattern.append(t.lower())
+                    identical_count += 1
+                else:
+                    pattern.append('*')
+
+            # 必须至少保留了一个原始词根，不能是全盘替换（如 'old_val' -> 'new_var' = '*_*'）
+            if identical_count > 0 and identical_count < len(t_parts):
+                sep_display = '_' if t_sep == '_' else ''
+                return sep_display.join(pattern)
+
+        # 单词变量、长度改变、结构完全改变，统一归为不可信模式
+        return '*'
     # =========================================================================
     # 基础工具与命名规范检测 (原样保留)
     # =========================================================================
     def _detect_naming_style(self, name: str) -> str:
-        if '_' in name:
-            return 'SCREAMING_SNAKE' if name.isupper() else 'snake_case'
-        elif name.islower():
+        if not name:
+            return 'unknown'
+        core_name = name.strip('_')
+
+        if not core_name:
+            return 'unknown'
+        if '_' in core_name:
+            return 'SCREAMING_SNAKE' if core_name.isupper() else 'snake_case'
+        if core_name.islower():
             return 'single_lower'
-        elif name.isupper():
+        if core_name.isupper():
             return 'single_upper'
-        elif name[0].islower() and any(c.isupper() for c in name):
+        if core_name[0].islower():
             return 'camelCase'
-        elif name[0].isupper() and any(c.islower() for c in name):
+        if core_name[0].isupper():
             return 'PascalCase'
         return 'unknown'
 
@@ -146,9 +274,6 @@ class LightweightCandidateGenerator:
             words.append(w)
         return words
 
-    # =========================================================================
-    # 复杂度过滤系统 (特征提取与验证)
-    # =========================================================================
     def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
                                        batch_size: int = 64) -> torch.Tensor:
         all_embeddings = []
@@ -201,9 +326,8 @@ class LightweightCandidateGenerator:
     def _verify_ast_single(self, cand: str, ctx: dict) -> str | None:
         if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
             return None
-        # 使用你外部配置的 CodeTransformer 进行校验
         try:
-            from utils.ast_tools import CodeTransformer  # 根据实际路径调整
+            from utils.ast_tools import CodeTransformer
             CodeTransformer.validate_and_apply(ctx['code_bytes'], ctx['identifiers'], {ctx['target_name']: cand},
                                                analyzer=self.analyzer)
             return cand
@@ -211,30 +335,34 @@ class LightweightCandidateGenerator:
             return None
 
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx):
-        """完全还原：纯粹的余弦相似度 + Heuristic Bonus 过滤逻辑，带全链路监控日志"""
         base_threshold = ctx.get('semantic_threshold', 0.85)
         entity_type = ctx.get('entity_type', 'VARIABLE')
 
-        # 1. 预过滤：基础检查
+        # === 新增/修改：提取 PPL 开关 ===
+        is_ppl_filter = ctx.get('is_ppl_filter', True)
+
+        ppl_max_ratio = ctx.get('ppl_max_ratio', 1.2)
+        ppl_max_abs = ctx.get('ppl_max_abs', 50.0)
+
         base_cands = []
         for cand in candidate_list:
-            if cand in ctx['keywords'] or cand == ctx['target_name']:
-                print(f"        🚫 [Filter | Keyword/Self] '{cand}'")
-                continue
-            if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand):
-                print(f"        🚫 [Filter | Style Clash] '{cand}' (Expected: {ctx['original_style']})")
-                continue
+            if cand in ctx['keywords'] or cand == ctx['target_name']: continue
+            if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
             base_cands.append(cand)
+        if not base_cands: return 0
 
-        if not base_cands:
-            return 0
-
-        # 2. 提取原始向量
         orig_emb = None
         if base_threshold > 0:
             orig_emb = self._get_variable_token_embeddings(
                 [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
             ).to(self.mlm_engine.device)
+
+        orig_context = ctx.get('full_code_str', ctx['local_prefix'] + ctx['target_name'] + ctx['local_suffix'])
+        orig_ppl = None
+
+        pattern_trust_cache = {}
+        TRUST_TEST_REQ = 3
+        TRUST_DIFF_MARGIN = 2.0
 
         added = 0
         CHUNK_SIZE = max(50, quota * 2)
@@ -242,89 +370,190 @@ class LightweightCandidateGenerator:
         target_parts, _ = self._split_identifier(target_name)
         return_type = ctx.get('return_type', None)
 
+        all_evaluated_cands = []
+
         for i in range(0, len(base_cands), CHUNK_SIZE):
             if added >= quota: break
 
             chunk = base_cands[i: i + CHUNK_SIZE]
-            filtered_chunk = []
-            heuristic_bonuses = []
+            filtered_chunk, heuristic_bonuses = [], []
 
             for cand in chunk:
                 bonus = 0.0
                 if hasattr(self, 'scorer'):
                     cand_parts, _ = self._split_identifier(cand)
-                    bonus = self.scorer.calculate_heuristic_score(
-                        cand_parts, entity_type, target_parts=target_parts, return_type=return_type
-                    )
-
-                if bonus <= -100:
-                    print(f"        🚫 [Filter | NLP Rules] '{cand}' (Score: {bonus})")
-                    continue
-                if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
-                    print(f"        🚫 [Filter | AST Conflict] '{cand}' (Scope collision or Syntax error)")
-                    continue
-
+                    bonus = self.scorer.calculate_heuristic_score(cand_parts, entity_type, target_parts, return_type)
+                if bonus <= -100: continue
+                if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand): continue
                 filtered_chunk.append(cand)
                 heuristic_bonuses.append(bonus)
 
             if not filtered_chunk: continue
-            semantically_valid = []
 
-            # 3. 核心打分与拦截
+            semantically_valid = []
             if base_threshold > 0:
                 prefixes = [ctx['local_prefix']] * len(filtered_chunk)
                 suffixes = [ctx['local_suffix']] * len(filtered_chunk)
-
                 cand_embs = self._get_variable_token_embeddings(prefixes, filtered_chunk, suffixes).to(
                     self.mlm_engine.device)
                 sims = F.cosine_similarity(orig_emb, cand_embs)
-
                 for cand, sim, bonus in zip(filtered_chunk, sims, heuristic_bonuses):
                     final_score = sim.item() + bonus
+                    dynamic_threshold = self._get_dynamic_threshold(
+                        target_name, cand, base_threshold
+                    )
 
-                    if final_score >= base_threshold:
-                        # 记录符合语义的词汇，留给下一步 AST 验证
-                        semantically_valid.append((cand, final_score, sim.item(), bonus))
-                    else:
-                        print(
-                            f"        🚫 [Filter | Semantic] '{cand}' (Sim: {sim.item():.3f} + Bonus: {bonus:.3f} = {final_score:.3f} < {base_threshold})")
+                    if final_score >= dynamic_threshold:
+                        semantically_valid.append((cand, final_score))
             else:
-                # 如果不需要语义打分，直接赋默认分过关
-                semantically_valid = [(cand, 1.0, 1.0, 0.0) for cand in filtered_chunk]
+                semantically_valid = [(cand, 1.0) for cand in filtered_chunk]
 
-            # 4. 最终 AST 验证并加入池
-            for cand_data in semantically_valid:
-                if added >= quota: break
-                cand, final_score, sim_val, bonus_val = cand_data
-
+            eval_queue = []
+            for cand, final_score in semantically_valid:
                 valid_cand = self._verify_ast_single(cand, ctx)
                 if valid_cand and valid_cand not in final_candidates:
+                    pattern_key = self._get_mutation_pattern(target_name, valid_cand)
+                    if pattern_key != '*':
+                        pattern_trust_cache.setdefault(pattern_key,
+                                                       {'tests': 0, 'passes': 0, 'max_diff': 0.0, 'trusted': False})
+
+                    if 'full_code_str' in ctx and 'code_bytes' in ctx:
+                        mod_bytes = bytearray(ctx['code_bytes'])
+                        cand_bytes = valid_cand.encode('utf-8')
+                        occurrences = sorted(ctx['identifiers'][ctx['target_name']], key=lambda x: x['start'],
+                                             reverse=True)
+                        for occ in occurrences: mod_bytes[occ['start']:occ['end']] = cand_bytes
+                        adv_context = mod_bytes.decode('utf-8', errors='replace')
+                    else:
+                        adv_context = ctx['local_prefix'] + valid_cand + ctx['local_suffix']
+
+                    eval_queue.append(
+                        {'cand': valid_cand, 'score': final_score, 'pattern': pattern_key, 'context': adv_context})
+
+            # === LLM 批量计算 (加入 PPL 开关限制) ===
+            batch_contexts = []
+            for item in eval_queue:
+                pat = item['pattern']
+                if pat == '*' or not pattern_trust_cache[pat]['trusted']:
+                    batch_contexts.append(item['context'])
+
+            # === 修改：如果关闭了 is_ppl_filter，直接跳过 LLM 推理计算 ===
+            if is_ppl_filter and batch_contexts and hasattr(self, 'llm_client') and self.llm_client:
+                ppl_batch_size = self.config.get('ppl_batch_size', 4)
+                if orig_ppl is None:
+                    orig_ppl = self._calculate_perplexity_batch([orig_context], batch_size=1)[0]
+                adv_ppls = self._calculate_perplexity_batch(batch_contexts, batch_size=ppl_batch_size)
+
+                ppl_idx = 0
+                for item in eval_queue:
+                    pat = item['pattern']
+                    if pat == '*' or not pattern_trust_cache[pat]['trusted']:
+                        item['adv_ppl'] = adv_ppls[ppl_idx]
+                        ppl_idx += 1
+
+            # === 结果结算与缓存动态更新 ===
+            for item in eval_queue:
+                if added >= quota: break
+
+                valid_cand, final_score, pattern_key = item['cand'], item['score'], item['pattern']
+
+                # === 修改：关闭 PPL 时，不执行后面的逻辑，全部直接放行 ===
+                if not is_ppl_filter or not hasattr(self, 'llm_client') or not self.llm_client:
                     final_candidates.append(valid_cand)
                     added += 1
-                    # ==========================================
-                    # 【核心修改】：打印成功通过的所有考核指标
-                    # ==========================================
-                    if base_threshold > 0:
-                        print(
-                            f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f} = Sim {sim_val:.3f} + Bonus {bonus_val:.3f})")
-                    else:
-                        print(f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Semantic check disabled)")
+                    # print(
+                        # f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f}) | [PPL Check Disabled]")
+                    continue
+
+                is_trusted_now = False
+                if pattern_key != '*':
+                    is_trusted_now = pattern_trust_cache[pattern_key]['trusted']
+
+                if is_trusted_now:
+                    final_candidates.append(valid_cand)
+                    added += 1
+                    # print(
+                    #     f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f}) | [PPL: Cached Auto-Pass (Pattern '{pattern_key}')]")
+                    continue
+
+                adv_ppl = item['adv_ppl']
+                ppl_diff = adv_ppl - orig_ppl
+                ppl_ratio = (adv_ppl / orig_ppl) if orig_ppl > 0 else float('inf')
+
+                # 全局评估池，用于存放所有走过 PPL 计算的候选词以备抢救
+                all_evaluated_cands.append({
+                    "cand": valid_cand, "score": final_score, "adv_ppl": adv_ppl,
+                    "ppl_ratio": ppl_ratio, "ppl_diff": ppl_diff, "pattern": pattern_key
+                })
+
+                # [由于加入了 is_ppl_filter 拦截，以下逻辑只有在开启 PPL 时才会走到]
+                if orig_ppl > 0 and adv_ppl != float('inf') and hasattr(self, 'ppl_stats'):
+                    self.ppl_stats["total_evaluated"] += 1
+                    self.ppl_stats["diff_distribution"].append(ppl_diff)
+                    self.ppl_stats["ratio_distribution"].append(ppl_ratio)
+
+                passed_ppl_check = True
+                is_abs_over = adv_ppl > ppl_max_abs
+                is_ratio_over = ppl_ratio > ppl_max_ratio
+
+                if is_abs_over or is_ratio_over:
+                    passed_ppl_check = False
+                    if hasattr(self, 'ppl_stats'):
+                        if is_abs_over and is_ratio_over:
+                            self.ppl_stats["rejected_both"] += 1
+                        elif is_abs_over:
+                            self.ppl_stats["rejected_by_abs"] += 1
+                        elif is_ratio_over:
+                            self.ppl_stats["rejected_by_ratio"] += 1
+
+                if passed_ppl_check:
+                    final_candidates.append(valid_cand)
+                    added += 1
+                    # print(
+                    #     f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f}) | [PPL: {orig_ppl:.1f} -> {adv_ppl:.1f} (Ratio: {ppl_ratio:.2f}x, Diff: {ppl_diff:+.1f})]")
+
+                    if pattern_key != '*':
+                        p_info = pattern_trust_cache[pattern_key]
+                        if not p_info['trusted']:
+                            p_info['tests'] += 1
+                            p_info['passes'] += 1
+                            p_info['max_diff'] = max(p_info['max_diff'], ppl_diff)
+                            if p_info['tests'] >= TRUST_TEST_REQ and p_info['passes'] == p_info['tests'] and p_info[
+                                'max_diff'] <= TRUST_DIFF_MARGIN:
+                                p_info['trusted'] = True
+                                # print(
+                                #     f"        💡 [Heuristic] Pattern '{pattern_key}' is now trusted (Max Diff: {p_info['max_diff']:+.1f}). Subsequent candidates will skip PPL check.")
                 else:
-                    if not valid_cand:
-                        print(f"        🚫 [Filter | Final AST] '{cand}' (Failed context insertion verify)")
-                    else:
-                        print(f"        🚫 [Filter | Duplicate] '{cand}' (Already in final pool)")
+                    if pattern_key != '*':
+                        pattern_trust_cache[pattern_key]['tests'] += 1
+                    print(
+                        f"        🚫 [Filter | PPL Overload] '{valid_cand}' | [PPL: {orig_ppl:.1f} -> {adv_ppl:.1f} (Ratio: {ppl_ratio:.2f}x, Diff: {ppl_diff:+.1f})]")
+
+        if is_ppl_filter and added == 0 and all_evaluated_cands:
+            print(f"        ⚠️ [Fallback] 变量 '{target_name}' 的 PPL 过滤全军覆没。启动综合打分抢救机制。")
+            for item in all_evaluated_cands:
+                item['comp_score'] = item['score'] / max(1.0, item['ppl_ratio'])
+            all_evaluated_cands.sort(key=lambda x: x['comp_score'], reverse=True)
+
+            rescue_quota = min(3, len(all_evaluated_cands))
+            for i in range(rescue_quota):
+                item = all_evaluated_cands[i]
+                valid_cand = item['cand']
+                final_candidates.append(valid_cand)
+                added += 1
+                pat = item['pattern']
+                if pat != '*' and pat in pattern_trust_cache:
+                    pattern_trust_cache[pat]['tests'] += 1
+                print(
+                    f"        🚑 [Rescued | {added}/{quota}] '{valid_cand}' (Sim: {item['score']:.3f}, PPL Ratio: {item['ppl_ratio']:.2f}x) -> Comp Score: {item['comp_score']:.3f}")
 
         return added
 
-    # =========================================================================
-    # 核心入口: 仅执行 MLM 生成与过滤
-    # =========================================================================
-    def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 20) -> Dict[
+    def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 20,
+                            is_ppl_filter: bool = False) -> Dict[
         str, List[str]]:
         """
         批量快速生成 MLM 候选词。
-        返回的数据将直接送入 RNNS 进行显著性排序。
         """
         results = {task["target_name"]: [] for task in batch_tasks}
         mlm_tracking = []
@@ -334,49 +563,76 @@ class LightweightCandidateGenerator:
         # 1. 任务解析与 MLM 变体构建
         for task_idx, task in enumerate(batch_tasks):
             target_name = task["target_name"]
-            code_str = task["code_str"]
-            code_bytes = code_str.encode("utf-8")
 
-            identifiers = self.analyzer.extract_identifiers(code_bytes)
-            if target_name not in identifiers: continue
+            # ==========================================
+            # A. 生成阶段：严格使用切片数据 (Code Slice)
+            # ==========================================
+            slice_code_str = task["code_str"]
+            slice_code_bytes = slice_code_str.encode("utf-8")
 
-            best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
-            target_info = identifiers[target_name][best_occ_idx]
+            # 【核心修正】：仅解析切片代码的 AST，获取相对坐标
+            slice_identifiers = self.analyzer.extract_identifiers(slice_code_bytes)
 
-            entity_type = 'BOOLEAN_VAR' if target_name.startswith(('is_', 'has_', 'can_', 'should_')) else (
+            # 如果切片后变量意外丢失（通常不会发生，容错防崩），跳过
+            if target_name not in slice_identifiers:
+                continue
+
+            # 使用切片内的标识符获取最佳位置与坐标
+            best_occ_idx = self._find_best_context_occurrence(slice_code_bytes, slice_identifiers[target_name])
+            target_info = slice_identifiers[target_name][best_occ_idx]
+
+            leading_m = re.match(r'^_+', target_name)
+            leading_us = leading_m.group(0) if leading_m else ""
+            core_name = target_name[len(leading_us):] if leading_us else target_name
+
+            entity_type = 'BOOLEAN_VAR' if core_name.startswith(('is_', 'has_', 'can_', 'should_')) else (
                 'FUNCTION' if target_info.get('entity_type') == 'function' else 'VARIABLE')
+
             original_style = self._detect_naming_style(target_name)
-            parts, style = self._split_identifier(target_name)
-            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, target_info['start'],
-                                                                         target_info['end'])
+            parts, style = self._split_identifier(core_name)
+
+            prefix_bytes = slice_code_bytes[:target_info['start']]
+            suffix_bytes = slice_code_bytes[target_info['end']:]
+
+            local_prefix = prefix_bytes.decode("utf-8", errors="replace")
+            local_suffix = suffix_bytes.decode("utf-8", errors="replace")
 
             task_metadata[task_idx] = {
-                "target_name": target_name, "parts": parts, "style": style, "n_parts": len(parts),
-                "identifiers": identifiers, "entity_type": entity_type, "original_style": original_style,
-                "code_bytes": code_bytes, "local_prefix": local_prefix, "local_suffix": local_suffix,
+                "target_name": target_name, "core_name": core_name, "leading_us": leading_us,
+                "parts": parts, "style": style, "n_parts": len(parts),
+                "entity_type": entity_type, "original_style": original_style,
+
+                # 验证阶段 (PPL)：保存透传的全量数据
+                "full_code_str": task["full_code_str"],
+                "full_code_bytes": task["full_code_str"].encode("utf-8"),
+                "full_identifiers": task.get("full_identifiers", slice_identifiers),
+
+                "local_prefix": local_prefix, "local_suffix": local_suffix,
                 "raw_mlm_cands": []
             }
 
-            prefix_str = local_prefix[max(0, len(local_prefix) - 700):]
-            suffix_str = local_suffix[:700]
+            MAX_CHAR_LIMIT = 2500
+
+            prefix_str = local_prefix[-MAX_CHAR_LIMIT:] if len(local_prefix) > MAX_CHAR_LIMIT else local_prefix
+            suffix_str = local_suffix[:MAX_CHAR_LIMIT] if len(local_suffix) > MAX_CHAR_LIMIT else local_suffix
 
             variations = []
             if len(parts) == 1:
                 variations.extend([
-                    {'expand_mode': 'none', 'num_masks': 1, 'masked_str': mask_token},
-                    {'expand_mode': 'prefix', 'num_masks': 1, 'masked_str': f"{mask_token}_{target_name}"},
-                    {'expand_mode': 'suffix', 'num_masks': 1, 'masked_str': f"{target_name}_{mask_token}"}
+                    {'expand_mode': 'none', 'num_masks': 1, 'masked_str': leading_us + mask_token},
+                    {'expand_mode': 'prefix', 'num_masks': 1, 'masked_str': leading_us + f"{mask_token}_{core_name}"},
+                    {'expand_mode': 'suffix', 'num_masks': 1, 'masked_str': leading_us + f"{core_name}_{mask_token}"}
                 ])
             else:
                 for i in range(len(parts)):
+                    m_str = self._build_masked_string(parts, i, i + 1, 1, style, mask_token, core_name)
                     variations.append({'expand_mode': 'sub', 'start': i, 'end': i + 1, 'num_masks': 1,
-                                       'masked_str': self._build_masked_string(parts, i, i + 1, 1, style, mask_token,
-                                                                               target_name)})
+                                       'masked_str': leading_us + m_str})
                 if len(parts) >= 2:
                     for i in range(len(parts) - 1):
+                        m_str = self._build_masked_string(parts, i, i + 2, 2, style, mask_token, core_name)
                         variations.append({'expand_mode': 'sub', 'start': i, 'end': i + 2, 'num_masks': 2,
-                                           'masked_str': self._build_masked_string(parts, i, i + 2, 2, style,
-                                                                                   mask_token, target_name)})
+                                           'masked_str': leading_us + m_str})
 
             for var in variations:
                 mlm_tracking.append({"task_idx": task_idx, "cropped_code": prefix_str + var['masked_str'] + suffix_str,
@@ -384,7 +640,6 @@ class LightweightCandidateGenerator:
 
         if not task_metadata: return results
 
-        # 2. 批量 MLM 推理
         all_cropped_codes = [item["cropped_code"] for item in mlm_tracking]
         batch_logits, batch_mask_indices = self._get_model_logits_batched(all_cropped_codes)
 
@@ -405,43 +660,57 @@ class LightweightCandidateGenerator:
                 mask_indices = batch_mask_indices[i]
                 num_masks = var_info.get('num_masks', 1)
 
+                core_name = meta["core_name"]
+                leading_us = meta["leading_us"]
+
                 if len(mask_indices) < num_masks: continue
 
                 if num_masks == 1:
                     words = self._decode_words(logits[0, mask_indices[0], :], top_k_mlm)
                     for w in words:
                         if var_info.get('expand_mode') == 'prefix':
-                            meta["raw_mlm_cands"].append(f"{w}_{meta['target_name']}")
+                            meta["raw_mlm_cands"].append(f"{leading_us}{w}_{core_name}")
                         elif var_info.get('expand_mode') == 'suffix':
-                            meta["raw_mlm_cands"].append(f"{meta['target_name']}_{w}")
+                            meta["raw_mlm_cands"].append(f"{leading_us}{core_name}_{w}")
                         else:
                             if meta["n_parts"] == 1:
-                                meta["raw_mlm_cands"].append(w)
+                                meta["raw_mlm_cands"].append(f"{leading_us}{w}")
                             else:
-                                meta["raw_mlm_cands"].append(_join_parts(
+                                joined = _join_parts(
                                     meta["parts"][:var_info['start']] + [w] + meta["parts"][var_info['end']:],
-                                    meta["target_name"], meta["style"]))
+                                    core_name, meta["style"])
+                                meta["raw_mlm_cands"].append(f"{leading_us}{joined}")
                 elif num_masks == 2:
                     top_k_2holes = min(4, max(2, top_k_mlm // 4))
                     words1 = self._decode_words(logits[0, mask_indices[0], :], top_k_2holes)
                     words2 = self._decode_words(logits[0, mask_indices[1], :], top_k_2holes)
                     for w1, w2 in itertools.product(words1, words2):
-                        meta["raw_mlm_cands"].append(
-                            _join_parts(meta["parts"][:var_info['start']] + [w1, w2] + meta["parts"][var_info['end']:],
-                                        meta["target_name"], meta["style"]))
+                        joined = _join_parts(
+                            meta["parts"][:var_info['start']] + [w1, w2] + meta["parts"][var_info['end']:],
+                            core_name, meta["style"])
+                        meta["raw_mlm_cands"].append(f"{leading_us}{joined}")
 
         # 4. 执行复杂度过滤系统
         for t_idx, meta in task_metadata.items():
             unique_mlm_cands = list(dict.fromkeys(meta["raw_mlm_cands"]))
+
+            # 【核心修正】：组装 ctx 给 PPL 验证模块时，完全使用全量数据
             ctx = {
-                'code_bytes': meta["code_bytes"], 'target_name': meta["target_name"],
-                'identifiers': meta["identifiers"],
-                'keywords': self.analyzer.keywords, 'original_style': meta["original_style"],
+                'code_bytes': meta["full_code_bytes"],  # PPL 字节替换基底
+                'full_code_str': meta["full_code_str"],  # PPL 相对变化率对比组
+                'target_name': meta["target_name"],
+                'identifiers': meta["full_identifiers"],  # PPL 替换所需的全局绝对坐标
+                'keywords': self.analyzer.keywords,
+                'original_style': meta["original_style"],
                 'local_prefix': meta["local_prefix"],
-                'local_suffix': meta["local_suffix"], 'semantic_threshold': self.config.get('semantic_threshold', 0.85),
-                'preserve_style': self.config.get('preserve_style', True), 'entity_type': meta["entity_type"],
+                'local_suffix': meta["local_suffix"],
+                'semantic_threshold': self.config.get('semantic_threshold', 0.85),
+                'preserve_style': self.config.get('preserve_style', True),
+                'entity_type': meta["entity_type"],
                 'return_type': next(
-                    (u['return_type'] for u in meta["identifiers"][meta["target_name"]] if u.get('return_type')), None)
+                    (u['return_type'] for u in meta["full_identifiers"].get(meta["target_name"], []) if
+                     u.get('return_type')), None),
+                'is_ppl_filter': is_ppl_filter
             }
 
             final_candidates = []

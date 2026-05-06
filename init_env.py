@@ -50,25 +50,24 @@ class BiLSTMClassifier(nn.Module):
         return SequenceClassifierOutput(loss=loss, logits=logits)
 
 
-# 🚀 修改 1：将函数改为通用的 augment_data，支持指定 label
 def augment_data(df: pd.DataFrame, needed_count: int, label_value: int) -> pd.DataFrame:
     funcs = df['func'].tolist()
 
     # 预过滤：跳过超过 3000 字符的超大样本
-    funcs = [f for f in funcs if len(f) <= 3000]
+    funcs =[f for f in funcs if len(f) <= 3000]
     n_samples = len(funcs)
 
     if n_samples == 0:
-        return pd.DataFrame({'func': [], 'label': []})
+        return pd.DataFrame({'func':[], 'label':[]})
 
     base_aug = needed_count // n_samples
     remainder = needed_count % n_samples
 
-    aug_counts = [base_aug] * n_samples
+    aug_counts =[base_aug] * n_samples
     for idx in random.sample(range(n_samples), remainder):
         aug_counts[idx] += 1
 
-    augmented_funcs = []
+    augmented_funcs =[]
     label_name = "漏洞(1)" if label_value == 1 else "安全(0)"
     print(f"[*] {label_name} 样本分配策略: 平均每个样本进行 {base_aug} 到 {base_aug + 1} 次混淆...")
 
@@ -126,7 +125,7 @@ def prepare_dataset(parquet_path):
     # 设定总量目标 (每类 8 万，总共 16 万)
     target_count = 18945
 
-    # ================= 🚀 修改 2：实现完美的对称增强 =================
+    # ================= 实现完美的对称增强 =================
 
     # 步骤 A: 漏洞样本处理
     if real_vul_count < target_count:
@@ -145,14 +144,10 @@ def prepare_dataset(parquet_path):
     # 步骤 B: 安全样本处理 (强制使其结构与漏洞样本一模一样)
     print(f"\n[*] 为了防止捷径学习，安全样本将强制采用相同的 [原生:增强] 比例：{vul_original_used} : {vul_aug_used}")
 
-    # 1. 抽取与漏洞原生数量相等的原生安全样本
     base_safe = df_safe.sample(n=vul_original_used, random_state=42)
 
-    # 2. 如果漏洞进行了增强，安全也必须进行增强
     if vul_aug_used > 0:
-        # 找出未被抽取作为 base 的剩余安全样本，作为增强的“种子”
         remaining_safe = df_safe.drop(base_safe.index)
-        # 选取一部分种子进行混淆 (不需要全用，选一批代表即可)
         seed_safe = remaining_safe.sample(n=min(len(remaining_safe), 30000), random_state=42)
         print(f"[*] 启动安全样本增强程序...")
         aug_df_safe = augment_data(seed_safe, vul_aug_used, label_value=0)
@@ -160,8 +155,6 @@ def prepare_dataset(parquet_path):
         sampled_safe = pd.concat([base_safe, aug_df_safe], ignore_index=True)
     else:
         sampled_safe = base_safe
-
-    # ===============================================================
 
     # 最终合并并彻底打乱顺序
     df_final = pd.concat([sampled_safe, sampled_vul]).sample(frac=1, random_state=42).reset_index(drop=True)
@@ -177,11 +170,12 @@ def prepare_dataset(parquet_path):
 # =============== 训练执行 ===============
 
 def train_models(dataset):
+    # 📌 此处将 CodeT5 替换为了 UniXcoder
     models_to_train = {
-        "CodeBERT": {"path": "microsoft/codebert-base", "type": "transformer"},
+        "GraphCodeBERT": {"path": "microsoft/graphcodebert-base", "type": "transformer"},
+        "UniXcoder": {"path": "microsoft/unixcoder-base", "type": "transformer"},
     }
 
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
     peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
 
     for name, info in models_to_train.items():
@@ -191,6 +185,20 @@ def train_models(dataset):
             continue
 
         print(f"\n🚀 Preparing model: {name}")
+
+        # 📌 核心修复：手动传入所有特殊的 token，强行用纯字符串覆盖掉云端 json 中引发类型异常的旧字典
+        # 从而完美避开 Rust tokenizers 的列表类型检测错误！
+        tokenizer = AutoTokenizer.from_pretrained(
+            info["path"],
+            bos_token="<s>",
+            eos_token="</s>",
+            sep_token="</s>",
+            cls_token="<s>",
+            unk_token="<unk>",
+            pad_token="<pad>",
+            mask_token="<mask>",
+            additional_special_tokens=[]
+        )
 
         if info["type"] == "transformer":
             model = AutoModelForSequenceClassification.from_pretrained(
@@ -218,7 +226,6 @@ def train_models(dataset):
                 output_dir=f"./temp_{name}",
                 per_device_train_batch_size=16,
                 num_train_epochs=3,
-                # 🚀 修改 3：对于 LoRA 微调，学习率必须调大，否则无法在 3 epochs 内收敛
                 learning_rate=3e-4,
                 save_strategy="epoch",
                 report_to="none",

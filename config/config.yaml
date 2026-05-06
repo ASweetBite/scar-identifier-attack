@@ -3,6 +3,7 @@ global:
   random_seed: 42
   max_workers: 8
   result_dir: "./results"
+  is_ppl_filter: true
 
 # Runtime Parameters
 run_params:
@@ -14,9 +15,20 @@ run_params:
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   use_majority_voting: false
 
+beam_params:
+  beam_size: 3
+  cand_chunk_size: 10
+  early_stop_delta: 0.3
+  beam_early_stop_strategy: patience
+  beam_early_stop_patience: 2
+  beam_early_stop_min_valid_vars: 3
+  beam_enable_ast_check: true
+
 # Target Models
 model_zoo:
   CodeBERT: "./models/binary_diversevul_codebert_pure_dataset"
+#  GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
+#  UniXCoder: "./models/binary_diversevul_unixcoder"
 
 llm_generator_name: "models/qwen2.5-1.5b-code"
 
@@ -39,6 +51,9 @@ heavyweight_candidate:
 # Attacker and Optimizer Configurations
 irtg_attacker:
   top_k: 5
+  rerank_after_llm_enrich: false
+  llm_probe_quota: 2
+  max_llm_enrich_attempts: 1
 
 genetic_algorithm:
   pop_size: 40
