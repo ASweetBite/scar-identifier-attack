@@ -396,51 +396,6 @@ class BeamSearchOptimizer:
         max_other_prob = max(max_other_prob, 1e-9)
         return math.log(max_other_prob) - math.log(orig_prob)
 
-    def _dedup_keep_order(self, items: List[str]) -> List[str]:
-        seen = set()
-        result = []
-        for item in items:
-            if item in seen:
-                continue
-            seen.add(item)
-            result.append(item)
-        return result
-
-    def _is_ast_legal_rename(self, curr_code: str, var: str, cand: str, analyzer: Any = None) -> bool:
-        """
-        在当前 beam 状态 curr_code 上校验 var -> cand 是否仍然 AST 合法。
-        注意：候选生成阶段的合法性是在原始代码上验证的；Beam 组合替换后仍可能产生新冲突，
-        所以这里必须基于 curr_code 重新解析。
-        """
-        if not self.enable_ast_check:
-            return True
-
-        if analyzer is None:
-            if not self._warned_missing_analyzer:
-                print("    [Warn] Beam AST check enabled but analyzer is None; fallback to rename_fn only.")
-                self._warned_missing_analyzer = True
-            return True
-
-        try:
-            code_bytes = curr_code.encode("utf-8")
-            identifiers = analyzer.extract_identifiers(code_bytes)
-
-            if var not in identifiers:
-                return False
-            if not analyzer.can_rename_to(code_bytes, var, cand):
-                return False
-
-            from utils.ast_tools import CodeTransformer
-            CodeTransformer.validate_and_apply(
-                code_bytes,
-                identifiers,
-                {var: cand},
-                analyzer=analyzer,
-            )
-            return True
-        except Exception:
-            return False
-
     def _should_stop_after_chunk(self, chunk_best_fitness_gain: float, valid_var_count: int,
                                  bad_chunk_count: int) -> bool:
         strategy = self.early_stop_strategy
@@ -462,7 +417,7 @@ class BeamSearchOptimizer:
         return False
 
     def run(self, code: str, original_pred: int, target_vars: List[str], subs_pool: Dict[str, List[str]],
-            variable_scores: Dict[str, float] = None, analyzer: Any = None):
+            variable_scores: Dict[str, float] = None):
 
         if variable_scores:
             sorted_vars = sorted(target_vars, key=lambda v: variable_scores.get(v, 0), reverse=True)
@@ -475,7 +430,6 @@ class BeamSearchOptimizer:
             if not codes_to_predict:
                 return [], []
 
-            codes_to_predict = self._dedup_keep_order(codes_to_predict)
             uncached_codes = [c for c in codes_to_predict if c not in query_cache]
 
             if uncached_codes:
@@ -499,11 +453,10 @@ class BeamSearchOptimizer:
         overall_best_fitness = initial_fitness
         overall_best_code = code
 
-        # 记录当前样本可用的有效变量数量。
         valid_var_count = len([v for v in sorted_vars if subs_pool.get(v, [])])
 
         for var in sorted_vars:
-            candidates = self._dedup_keep_order(subs_pool.get(var, []))
+            candidates = subs_pool.get(var, [])
             if not candidates:
                 continue
 
@@ -521,19 +474,14 @@ class BeamSearchOptimizer:
                         if cand == var:
                             continue
 
-                        # 关键新增：在当前 beam 代码状态上做 AST 合法性校验。
-                        if not self._is_ast_legal_rename(curr_code, var, cand, analyzer=analyzer):
-                            continue
-
                         try:
                             temp_code = self.rename_fn(curr_code, {var: cand})
-                            if temp_code and temp_code != curr_code:
+                            if temp_code:
                                 codes_to_predict.append(temp_code)
                         except Exception:
                             continue
 
                     if not codes_to_predict:
-                        # 当前 chunk 全部非法时，也算一个无收益 chunk，供 patience 策略使用。
                         if self.early_stop_strategy == "patience":
                             bad_chunk_count += 1
                             if self._should_stop_after_chunk(0.0, valid_var_count, bad_chunk_count):
@@ -554,7 +502,6 @@ class BeamSearchOptimizer:
                             overall_best_fitness = fitness
                             overall_best_code = temp_code
 
-                        # 全局熔断：发现翻转立即停止攻击并返回。
                         if pred != original_pred and self.run_mode == "attack":
                             verify_probs, verify_preds = _get_predictions([temp_code])
                             if verify_preds[0] != original_pred:
@@ -562,7 +509,6 @@ class BeamSearchOptimizer:
 
                         new_beam_candidates.append((fitness, temp_code, probs, pred))
 
-                    # 可配置早停策略。
                     if self.early_stop_strategy == "patience":
                         if chunk_best_fitness_gain < self.early_stop_delta:
                             bad_chunk_count += 1
@@ -574,7 +520,6 @@ class BeamSearchOptimizer:
 
             unique_candidates = {}
             for state in new_beam_candidates:
-                # 去重逻辑：保留相同代码下 fitness 最高的状态。
                 if state[1] not in unique_candidates or state[0] > unique_candidates[state[1]][0]:
                     unique_candidates[state[1]] = state
 
@@ -585,7 +530,7 @@ class BeamSearchOptimizer:
         final_probs = final_probs_list[0]
         final_pred = final_preds_list[0]
 
-        is_success = (final_pred != original_pred)
+        is_success = final_pred != original_pred
         return is_success, overall_best_code, final_probs, final_pred
 
 

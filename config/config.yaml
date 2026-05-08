@@ -7,7 +7,7 @@ global:
 
 # Runtime Parameters
 run_params:
-  samples: 100
+  samples: 200
   dataset: "./data/bigvul_polars.parquet"
   iterations: 25
   algorithm: "beam"
@@ -19,10 +19,9 @@ beam_params:
   beam_size: 3
   cand_chunk_size: 10
   early_stop_delta: 0.3
-  beam_early_stop_strategy: patience
+  beam_early_stop_strategy: none
   beam_early_stop_patience: 2
   beam_early_stop_min_valid_vars: 3
-  beam_enable_ast_check: true
 
 # Target Models
 model_zoo:
@@ -51,9 +50,9 @@ heavyweight_candidate:
 # Attacker and Optimizer Configurations
 irtg_attacker:
   top_k: 5
-  rerank_after_llm_enrich: false
+  rerank_after_llm_enrich: true
   llm_probe_quota: 2
-  max_llm_enrich_attempts: 1
+  max_llm_enrich_attempts: 2
 
 genetic_algorithm:
   pop_size: 40

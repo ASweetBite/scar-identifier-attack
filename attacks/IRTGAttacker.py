@@ -52,33 +52,22 @@ class IRTGAttacker:
         self.llm_gen = llm_gen
         self.rename_fn = rename_fn
 
-    @staticmethod
-    def _dedup_keep_order(items):
-        """保序去重，避免 list(set(...)) 打乱 LLM 候选词优先级。"""
-        seen = set()
-        result = []
-        for item in items or []:
-            if not item or item in seen:
-                continue
-            seen.add(item)
-            result.append(item)
-        return result
-
     def _merge_candidate_pools(self, mlm_pool: dict, llm_pool: dict, final_quota: int = 20) -> dict:
         """
-        严格按照优先级合并候选词池：
-        1. LLM 生成的高质量词汇享有绝对优先权 (排在最前面)。
-        2. MLM 生成的词汇作为 Padding (填充物)，用于补齐 LLM 数量不足的缺口。
-        3. 保序去重并截断至 final_quota。
+        按候选来源合并候选词池：
+        1. 先放入 LLM 候选词，确保 LLM 生成结果不会因数量不足被丢失。
+        2. 如果 LLM 候选数量不足，则用 MLM 候选词补齐。
+        3. 候选词去重逻辑由上游 cache 的 set 去重负责，因此最终顺序不强制保序。
         """
         final_pool = {}
-        all_vars = self._dedup_keep_order(list(llm_pool.keys()) + list(mlm_pool.keys()))
+        all_vars = set(mlm_pool.keys()).union(set(llm_pool.keys()))
 
         for var in all_vars:
-            llm_cands = self._dedup_keep_order(llm_pool.get(var, []))
-            mlm_cands = self._dedup_keep_order(mlm_pool.get(var, []))
+            llm_cands = llm_pool.get(var, [])
+            mlm_cands = mlm_pool.get(var, [])
 
             merged_cands = list(llm_cands)
+
             if len(merged_cands) < final_quota:
                 for cand in mlm_cands:
                     if cand not in merged_cands:
@@ -203,10 +192,9 @@ class IRTGAttacker:
             t_probe_start = time.time()
             try:
                 llm_probe_pool = self.llm_gen.generate_candidates(batch_tasks, target_quota=llm_probe_quota)
-                # 存入缓存：保序去重，不能使用 list(set(...))。
                 for var, cands in llm_probe_pool.items():
                     if var in sample_llm_cache:
-                        sample_llm_cache[var] = self._dedup_keep_order(cands)
+                        sample_llm_cache[var] = list(set(cands))
             finally:
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -286,9 +274,11 @@ class IRTGAttacker:
                         # 将新生成的词合并到全局缓存中：保序去重，保留 LLM 输出质量顺序。
                         for var, cands in new_llm_pool.items():
                             old_cands = sample_llm_cache.get(var, [])
-                            merged = self._dedup_keep_order(old_cands + list(cands or []))
+                            merged = list(set(old_cands + list(cands or [])))
+
                             if len(merged) > len(old_cands):
                                 deep_enriched_this_round = True
+
                             sample_llm_cache[var] = merged
                     finally:
                         gc.collect()
@@ -336,9 +326,6 @@ class IRTGAttacker:
                     run_kwargs["variable_scores"] = all_scores
                 if self.optimizer_type == "bo":
                     run_kwargs["rnns_best_seed"] = rnns_best_seed
-                if self.optimizer_type == "beam":
-                    # 传入 analyzer，使 Beam 能在组合替换过程中重新做 AST 合法性校验。
-                    run_kwargs["analyzer"] = analyzer
 
                 is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(**run_kwargs)
                 print(f"    [Time] Optimizer ({self.optimizer_type.upper()}) Run took {time.time() - t_opt_start:.2f}s")

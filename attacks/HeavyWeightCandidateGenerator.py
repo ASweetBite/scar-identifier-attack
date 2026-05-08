@@ -374,8 +374,8 @@ class HeavyWeightCandidateGenerator:
                 if not is_ppl_filter or not hasattr(self, 'llm_client') or not self.llm_client:
                     final_candidates.append(valid_cand)
                     added += 1
-                    print(
-                        f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {eval_data['score']:.3f}) | [PPL Check Disabled]")
+                    # print(
+                    #     f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {eval_data['score']:.3f}) | [PPL Check Disabled]")
                     continue
 
                 adv_ppl = adv_ppls[idx]
@@ -414,11 +414,12 @@ class HeavyWeightCandidateGenerator:
                     # print(
                     #     f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {eval_data['score']:.3f}) | [PPL: {orig_ppl:.1f} -> {adv_ppl:.1f} (Ratio: {ppl_ratio:.2f}x, Diff: {ppl_diff:+.1f})]")
                 else:
-                    print(
-                        f"        🚫 [Filter | PPL Overload] '{valid_cand}' | [PPL: {orig_ppl:.1f} -> {adv_ppl:.1f} (Ratio: {ppl_ratio:.2f}x, Diff: {ppl_diff:+.1f})]")
+                    # print(
+                        # f"        🚫 [Filter | PPL Overload] '{valid_cand}' | [PPL: {orig_ppl:.1f} -> {adv_ppl:.1f} (Ratio: {ppl_ratio:.2f}x, Diff: {ppl_diff:+.1f})]")
+                    pass
 
         if is_ppl_filter and added == 0 and all_evaluated_cands:
-            print(f"        ⚠️ [Fallback] 变量 '{target_name}' 的 PPL 过滤全军覆没。启动综合打分抢救机制。")
+            # print(f"        ⚠️ [Fallback] 变量 '{target_name}' 的 PPL 过滤全军覆没。启动综合打分抢救机制。")
 
             for item in all_evaluated_cands:
                 item['comp_score'] = item['score'] / max(1.0, item['ppl_ratio'])
@@ -432,8 +433,8 @@ class HeavyWeightCandidateGenerator:
                 final_candidates.append(valid_cand)
                 added += 1
 
-                print(
-                    f"        🚑 [Rescued | {added}/{quota}] '{valid_cand}' (Sim: {item['score']:.3f}, PPL Ratio: {item['ppl_ratio']:.2f}x) -> Comp Score: {item['comp_score']:.3f}")
+                # print(
+                #     f"        🚑 [Rescued | {added}/{quota}] '{valid_cand}' (Sim: {item['score']:.3f}, PPL Ratio: {item['ppl_ratio']:.2f}x) -> Comp Score: {item['comp_score']:.3f}")
 
         return added
 
