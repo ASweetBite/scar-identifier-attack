@@ -21,8 +21,8 @@ class LightweightCandidateGenerator:
         self.analyzer = analyzer
         self.config = config
         self.llm_client = llm_client  # 保存 LLM 句柄用于 PPL 计算
-        stats_path = config.get('naming_stats_path', 'naming_stats.json')
-
+        cg_cfg = self.config.get('candidate_generation', {})
+        stats_path = cg_cfg.get('naming_stats_path', 'naming_stats.json')
         from utils.scorer import StatisticalNamingScorer
         self.scorer = StatisticalNamingScorer(stats_path)
 
@@ -75,16 +75,16 @@ class LightweightCandidateGenerator:
 
         # 1. 纯前缀/后缀附加
         if cand_lower.endswith(f"_{target_lower}") or cand_lower.startswith(f"{target_lower}_"):
-            return min(0.98, base_threshold + 0.05)
+            return min(0.99, base_threshold + 0.05)
 
         # 2. 词根完全包含但没有分隔符
         if target_lower in cand_lower:
-            return min(0.98, base_threshold + 0.03)
+            return min(0.99, base_threshold + 0.03)
 
         # 3. 极小编辑距离
         import Levenshtein
         if Levenshtein.distance(target_lower, cand_lower) <= 2:
-            return min(0.98, base_threshold + 0.07)
+            return min(0.99, base_threshold + 0.07)
 
         # ==========================================================
         # 4. [终极版] 多词根局部微调：引入基于长度的重叠率惩罚
@@ -111,7 +111,7 @@ class LightweightCandidateGenerator:
                     if target_parts[-1].lower() != cand_parts[-1].lower():
                         penalty += 0.015
 
-                    return min(0.98, base_threshold + penalty)
+                    return min(0.99, base_threshold + penalty)
 
         # 5. 完全替换 / 无明显结构对齐
         return base_threshold
@@ -439,7 +439,8 @@ class LightweightCandidateGenerator:
 
             # === 修改：如果关闭了 is_ppl_filter，直接跳过 LLM 推理计算 ===
             if is_ppl_filter and batch_contexts and hasattr(self, 'llm_client') and self.llm_client:
-                ppl_batch_size = self.config.get('ppl_batch_size', 4)
+                cg_cfg = self.config.get('candidate_generation', {})
+                ppl_batch_size = cg_cfg.get('ppl_batch_size', 4)
                 if orig_ppl is None:
                     orig_ppl = self._calculate_perplexity_batch([orig_context], batch_size=1)[0]
                 adv_ppls = self._calculate_perplexity_batch(batch_contexts, batch_size=ppl_batch_size)
@@ -462,7 +463,7 @@ class LightweightCandidateGenerator:
                     final_candidates.append(valid_cand)
                     added += 1
                     # print(
-                        # f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f}) | [PPL Check Disabled]")
+                    #     f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f}) | [PPL Check Disabled]")
                     continue
 
                 is_trusted_now = False
@@ -694,23 +695,34 @@ class LightweightCandidateGenerator:
         for t_idx, meta in task_metadata.items():
             unique_mlm_cands = list(dict.fromkeys(meta["raw_mlm_cands"]))
 
-            # 【核心修正】：组装 ctx 给 PPL 验证模块时，完全使用全量数据
+            # 提取新版层级配置
+            cg_cfg = self.config.get('candidate_generation', {})
+            lw_cfg = cg_cfg.get('lightweight', {})
+
+            # 使用配置覆盖函数默认参数
+            actual_is_ppl_filter = cg_cfg.get('is_ppl_filter', is_ppl_filter)
+
             ctx = {
-                'code_bytes': meta["full_code_bytes"],  # PPL 字节替换基底
-                'full_code_str': meta["full_code_str"],  # PPL 相对变化率对比组
+                'code_bytes': meta["full_code_bytes"],
+                'full_code_str': meta["full_code_str"],
                 'target_name': meta["target_name"],
-                'identifiers': meta["full_identifiers"],  # PPL 替换所需的全局绝对坐标
+                'identifiers': meta["full_identifiers"],
                 'keywords': self.analyzer.keywords,
                 'original_style': meta["original_style"],
                 'local_prefix': meta["local_prefix"],
                 'local_suffix': meta["local_suffix"],
-                'semantic_threshold': self.config.get('semantic_threshold', 0.85),
-                'preserve_style': self.config.get('preserve_style', True),
+
+                # 读取专属和共享配置
+                'semantic_threshold': lw_cfg.get('semantic_threshold', 0.85),
+                'preserve_style': cg_cfg.get('preserve_style', True),
+                'is_ppl_filter': actual_is_ppl_filter,
+                'ppl_max_ratio': cg_cfg.get('ppl_max_ratio', 1.2),
+                'ppl_max_abs': cg_cfg.get('ppl_max_abs', 50.0),
+
                 'entity_type': meta["entity_type"],
                 'return_type': next(
                     (u['return_type'] for u in meta["full_identifiers"].get(meta["target_name"], []) if
                      u.get('return_type')), None),
-                'is_ppl_filter': is_ppl_filter
             }
 
             final_candidates = []

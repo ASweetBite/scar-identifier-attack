@@ -1,71 +1,92 @@
-# Core Global Configuration
+# ==========================================
+# 1. Global & Environment Settings
+# ==========================================
 global:
   random_seed: 42
   max_workers: 8
   result_dir: "./results"
-  is_ppl_filter: true
+  lang: "cpp"                 # 从 analyzer 移动到这里，统一全局语言
 
-# Runtime Parameters
+# ==========================================
+# 2. Runtime & Dataset Parameters
+# ==========================================
 run_params:
-  samples: 200
+  samples: 5
   dataset: "./data/bigvul_polars.parquet"
-  iterations: 25
-  algorithm: "beam"
-  run_mode: "attack"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   use_majority_voting: false
 
-beam_params:
-  beam_size: 3
-  cand_chunk_size: 10
-  early_stop_delta: 0.3
-  beam_early_stop_strategy: none
-  beam_early_stop_patience: 2
-  beam_early_stop_min_valid_vars: 3
+# ==========================================
+# 3. Models Configuration
+# ==========================================
+models:
+  mlm_engine: "microsoft/codebert-base-mlm"
+  llm_generator: "models/qwen2.5-1.5b-code"
+  target_models:
+    CodeBERT: "./models/binary_diversevul_codebert_pure_dataset"
+    # GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
 
-# Target Models
-model_zoo:
-  CodeBERT: "./models/binary_diversevul_codebert_pure_dataset"
-#  GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
-#  UniXCoder: "./models/binary_diversevul_unixcoder"
-
-llm_generator_name: "models/qwen2.5-1.5b-code"
-
-# Candidate Generation Configurations
-lightweight_candidate:
-  top_m: 15
-  fasttext_model_path: "./models/pretrained/fasttext_cpp.bin"
-  faiss_index_path: "./models/pretrained/faiss_cpp.index"
-  faiss_vocab_path: "./models/pretarined/vocab_cpp.json"
-
-heavyweight_candidate:
-  top_k_mlm: 60
-  top_n_keep: 50
-  semantic_threshold: 0.87
-  structural_semantic_threshold: 0.5
-  minilm_model_path: "models/binary_diversevul_codebert_pure_dataset"
-  context_ratio: 0.1
+# ==========================================
+# 4. Candidate Generation (MLM & LLM)
+# ==========================================
+candidate_generation:
   preserve_style: true
+  naming_stats_path: "naming_stats.json"
 
-# Attacker and Optimizer Configurations
-irtg_attacker:
-  top_k: 5
-  rerank_after_llm_enrich: true
-  llm_probe_quota: 2
-  max_llm_enrich_attempts: 2
+  # PPL 自然度评估设置
+  is_ppl_filter: true
+  ppl_batch_size: 4
+  ppl_max_ratio: 1.2
+  ppl_max_abs: 50.0
 
-genetic_algorithm:
-  pop_size: 40
-  stagnation_threshold: 5
-  mutation_rate_min: 0.1
-  mutation_rate_max: 0.5
-  elite_ratio: 0.25
+  # --- 轻量级 (MLM) 专属配置 ---
+  lightweight:
+    top_k_mlm: 60
+    top_n_keep: 50
+    semantic_threshold: 0.99
+    fasttext_model_path: "./models/pretrained/fasttext_cpp.bin"
+    faiss_index_path: "./models/pretrained/faiss_cpp.index"
+    faiss_vocab_path: "./models/pretrained/vocab_cpp.json" # 修复了你原本的拼写错误
 
-# Other System Components
-analyzer:
-  lang: "cpp"
-mlm_engine:
-  model_name: "microsoft/codebert-base-mlm"
+  # --- 重量级 (LLM) 专属配置 ---
+  heavyweight:
+    top_m: 25
+    semantic_threshold: 0.99
+    structural_semantic_threshold: 0.5
+    context_ratio: 0.1
+
+# ==========================================
+# 5. Attack Optimization Algorithms
+# ==========================================
+attack:
+  algorithm: "beam"     # greedy, beam, ga, bo (移动自 run_params)
+  iterations: 25        # 移动自 run_params
+
+  irtg:
+    top_k: 25
+    total_quota: 50
+    llm_probe_quota: 4
+    max_llm_enrich_attempts: 2
+    rerank_after_llm_enrich: true
+
+  beam_search:
+    beam_size: 3
+    cand_chunk_size: 10
+    early_stop_delta: 0.3
+    beam_early_stop_strategy: "none"
+    beam_early_stop_patience: 2
+    beam_early_stop_min_valid_vars: 3
+
+  genetic_algorithm:
+    pop_size: 40
+    stagnation_threshold: 5
+    mutation_rate_min: 0.1
+    mutation_rate_max: 0.5
+    elite_ratio: 0.25
+
+# ==========================================
+# 6. System Components
+# ==========================================
 smoother:
   num_samples: 10
   variance_threshold: 0.05

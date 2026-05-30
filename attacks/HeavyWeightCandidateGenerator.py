@@ -17,8 +17,8 @@ class HeavyWeightCandidateGenerator:
         self.llm_client = llm_client
         self.analyzer = analyzer
         self.config = config
-        stats_path = config.get('naming_stats_path', 'naming_stats.json')
-
+        cg_cfg = self.config.get('candidate_generation', {})
+        stats_path = cg_cfg.get('naming_stats_path', 'naming_stats.json')
         from utils.scorer import StatisticalNamingScorer
         self.scorer = StatisticalNamingScorer(stats_path)
 
@@ -362,7 +362,8 @@ class HeavyWeightCandidateGenerator:
                 adv_contexts_batch = [item["context"] for item in pending_ppl_eval]
 
                 # 动态读取 batch_size，兜底为 4
-                ppl_batch_size = self.config.get('ppl_batch_size', 4) if hasattr(self, 'config') else 4
+                cg_cfg = self.config.get('candidate_generation', {})
+                ppl_batch_size = cg_cfg.get('ppl_batch_size', 4)
                 adv_ppls = self._calculate_perplexity_batch(adv_contexts_batch, batch_size=ppl_batch_size)
 
             for idx, eval_data in enumerate(pending_ppl_eval):
@@ -628,22 +629,34 @@ JSON
             # ==========================================
             # 【核心修正】：交给 PPL 进行验证时，组装全量级 Context
             # ==========================================
+            # 提取新版层级配置
+            cg_cfg = self.config.get('candidate_generation', {})
+            hw_cfg = cg_cfg.get('heavyweight', {})
+
+            # 使用配置覆盖函数默认参数
+            actual_is_ppl_filter = cg_cfg.get('is_ppl_filter', is_ppl_filter)
+
             ctx = {
-                'code_bytes': meta["full_code_bytes"],  # 用于 PPL 字节绝对替换
-                'full_code_str': meta["full_code_str"],  # 用于作为 PPL 原始对比
+                'code_bytes': meta["full_code_bytes"],
+                'full_code_str': meta["full_code_str"],
                 'target_name': meta["target_name"],
-                'identifiers': meta["full_identifiers"],  # PPL 所需的全局坐标字典
+                'identifiers': meta["full_identifiers"],
                 'keywords': self.analyzer.keywords,
                 'original_style': meta["original_style"],
-                'local_prefix': meta["local_prefix"],  # PPL 回退方案使用的局部语句
+                'local_prefix': meta["local_prefix"],
                 'local_suffix': meta["local_suffix"],
-                'semantic_threshold': self.config.get('semantic_threshold', 0.85) if hasattr(self, 'config') else 0.85,
-                'preserve_style': self.config.get('preserve_style', True) if hasattr(self, 'config') else True,
+
+                # 读取专属和共享配置 (HeavyWeight 读 hw_cfg)
+                'semantic_threshold': hw_cfg.get('semantic_threshold', 0.85),
+                'preserve_style': cg_cfg.get('preserve_style', True),
+                'is_ppl_filter': actual_is_ppl_filter,
+                'ppl_max_ratio': cg_cfg.get('ppl_max_ratio', 1.2),
+                'ppl_max_abs': cg_cfg.get('ppl_max_abs', 50.0),
+
                 'entity_type': meta["entity_type"],
                 'return_type': next(
                     (u['return_type'] for u in meta["full_identifiers"].get(meta["target_name"], []) if
                      u.get('return_type')), None),
-                'is_ppl_filter': is_ppl_filter
             }
 
             final_candidates = []
