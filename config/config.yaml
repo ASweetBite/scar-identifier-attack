@@ -11,8 +11,8 @@ global:
 # 2. Runtime & Dataset Parameters
 # ==========================================
 run_params:
-  samples: 5
-  dataset: "./data/bigvul_polars.parquet"
+  samples: 300
+  dataset: "./data/alert/test.parquet"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   use_majority_voting: false
 
@@ -23,7 +23,7 @@ models:
   mlm_engine: "microsoft/codebert-base-mlm"
   llm_generator: "models/qwen2.5-1.5b-code"
   target_models:
-    CodeBERT: "./models/binary_diversevul_codebert_pure_dataset"
+    CodeBERT: "./models/ALERT_CodeBERT"
     # GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
 
 # ==========================================
@@ -34,7 +34,7 @@ candidate_generation:
   naming_stats_path: "naming_stats.json"
 
   # PPL 自然度评估设置
-  is_ppl_filter: true
+  is_ppl_filter: false
   ppl_batch_size: 4
   ppl_max_ratio: 1.2
   ppl_max_abs: 50.0
@@ -43,7 +43,7 @@ candidate_generation:
   lightweight:
     top_k_mlm: 60
     top_n_keep: 50
-    semantic_threshold: 0.99
+    semantic_threshold: 0.87
     fasttext_model_path: "./models/pretrained/fasttext_cpp.bin"
     faiss_index_path: "./models/pretrained/faiss_cpp.index"
     faiss_vocab_path: "./models/pretrained/vocab_cpp.json" # 修复了你原本的拼写错误
@@ -51,7 +51,7 @@ candidate_generation:
   # --- 重量级 (LLM) 专属配置 ---
   heavyweight:
     top_m: 25
-    semantic_threshold: 0.99
+    semantic_threshold: 0.87
     structural_semantic_threshold: 0.5
     context_ratio: 0.1
 
@@ -63,7 +63,7 @@ attack:
   iterations: 25        # 移动自 run_params
 
   irtg:
-    top_k: 25
+    top_k: 10
     total_quota: 50
     llm_probe_quota: 4
     max_llm_enrich_attempts: 2

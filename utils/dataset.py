@@ -29,9 +29,12 @@ class DatasetLoader:
 
         df = pd.read_parquet(filepath)
 
-        # ✨ 修改点 1：检查列时，增加对 'vul' 列的强制要求
-        if 'func' not in df.columns or 'cwe' not in df.columns or 'vul' not in df.columns:
-            raise ValueError("Parquet file must contain 'func', 'cwe', and 'vul' columns.")
+        # ✨ 修改点 1：根据 mode 动态校验列名
+        if 'func' not in df.columns or 'vul' not in df.columns:
+            raise ValueError("Parquet file must contain 'func' and 'vul' columns.")
+
+        if self.mode == "multi" and 'cwe' not in df.columns:
+            raise ValueError("In 'multi' mode, the Parquet file must also contain a 'cwe' column.")
 
         def _line_count(s):
             return len([l for l in str(s).splitlines() if l.strip()])
@@ -39,9 +42,11 @@ class DatasetLoader:
         initial_count = len(df)
         df = df[df["func"].apply(_line_count) > 1].copy()
 
-        # 数据清洗，确保类型正确
-        df["cwe"] = df["cwe"].fillna("").astype(str).str.strip()
-        # ✨ 修改点 2：清洗并标准化 vul 列为整数（0 或 1）
+        # ✨ 修改点 2：安全清洗。只有当 'cwe' 存在时才进行清洗操作
+        if 'cwe' in df.columns:
+            df["cwe"] = df["cwe"].fillna("").astype(str).str.strip()
+
+        # 清洗并标准化 vul 列为整数（0 或 1）
         df["vul"] = pd.to_numeric(df["vul"], errors='coerce').fillna(0).astype(int)
 
         print(
@@ -50,7 +55,7 @@ class DatasetLoader:
         processed_data = []
 
         if self.mode == "binary":
-            # ✨ 修改点 3：二分类核心修改，完全根据 vul 字段来决定 label
+            # 二分类核心修改，完全根据 vul 字段来决定 label
             # vul == 0 -> 安全 (-1)；vul == 1 -> 漏洞 (1)
             df['label'] = df['vul'].apply(lambda x: -1 if x == 0 else 1)
 
@@ -79,14 +84,13 @@ class DatasetLoader:
             self.label_map = {-1: "Safe", 1: "Vulnerable"}
 
         elif self.mode == "multi":
-            # ✨ 修改点 4：多分类核心修改。如果 vul 为 0，强制标记为 "Safe"
-            # 如果 vul 为 1，取 CWE 的值。如果此时 CWE 是空的，给一个默认的 "Unknown_CWE" 防止分类器报错
+            # 多分类核心修改
             def determine_multi_label(row):
                 if row['vul'] == 0:
                     return "Safe"
                 else:
                     cwe_val = str(row['cwe']).strip()
-                    if not cwe_val or cwe_val.lower() in self.safe_flags:
+                    if not cwe_val or cwe_val.lower() in getattr(self, 'safe_flags', []):
                         return "Unknown_CWE"
                     return cwe_val
 
@@ -147,13 +151,13 @@ class DatasetLoader:
         else:
             raise ValueError("Mode must be 'binary' or 'multi'")
 
+        # ✨ 修改点 3：在生成结果字典时使用 .get('cwe', '') 防止 KeyError
         for _, row in df.iterrows():
             processed_data.append({
                 "code": row["func"],
                 "label": int(row["label"]),
-                # ✨ 虽然被标记为了 Safe，但原始的 CWE 信息依然会保留在 raw_cwe 中供后续分析参考
-                "raw_cwe": row["cwe"],
-                "vul": row["vul"]  # 可选：把 vul 也输出保留
+                "raw_cwe": row.get("cwe", ""),  # 如果没有 cwe 列，默认为空字符串
+                "vul": row["vul"]
             })
 
         print(f"[*] Successfully processed {len(processed_data)} samples.")

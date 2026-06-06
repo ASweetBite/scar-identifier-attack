@@ -276,57 +276,107 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-def process_large_json_array(input_file, output_file, chunksize=10000):
-    print(f"正在通过 ijson 流式处理: {input_file}")
+# def process_large_json_array(input_file, output_file, chunksize=10000):
+#     print(f"正在通过 ijson 流式处理: {input_file}")
+#
+#     schema = pa.schema([
+#         ('func', pa.large_string()),
+#         ('vul', pa.int64())
+#     ])
+#
+#     writer = None
+#
+#     with open(input_file, 'rb') as f:
+#         # ijson.items 会迭代数组中的每一个对象
+#         # 'item' 表示数组里的每一个元素
+#         objects = ijson.items(f, 'item')
+#
+#         chunk = []
+#         total_processed = 0
+#
+#         for obj in objects:
+#             # 提取并清洗数据
+#             func = obj.get('func', "")
+#             # 处理可能的 target -> vul 映射
+#             vul = obj.get('vul', obj.get('target', 0))
+#
+#             chunk.append({'func': func, 'vul': vul})
+#
+#             if len(chunk) >= chunksize:
+#                 df = pd.DataFrame(chunk)
+#                 table = pa.Table.from_pandas(df, schema=schema)
+#
+#                 if writer is None:
+#                     writer = pq.ParquetWriter(output_file, schema)
+#
+#                 writer.write_table(table)
+#                 total_processed += len(chunk)
+#                 print(f"已写入 {total_processed} 行...")
+#                 chunk = []  # 清空缓冲区
+#
+#         # 处理最后剩余的数据
+#         if chunk:
+#             df = pd.DataFrame(chunk)
+#             table = pa.Table.from_pandas(df, schema=schema)
+#             if writer is None:
+#                 writer = pq.ParquetWriter(output_file, schema)
+#             writer.write_table(table)
+#             total_processed += len(chunk)
+#
+#     if writer:
+#         writer.close()
+#     print(f"✅ 处理完成！总计: {total_processed} 行，保存至: {output_file}")
+#
+#
+# if __name__ == "__main__":
+#     process_large_json_array("data/function.json", "data/test_binary.parquet")
 
-    schema = pa.schema([
-        ('func', pa.large_string()),
-        ('vul', pa.int64())
-    ])
+import pandas as pd
+import os
 
-    writer = None
 
-    with open(input_file, 'rb') as f:
-        # ijson.items 会迭代数组中的每一个对象
-        # 'item' 表示数组里的每一个元素
-        objects = ijson.items(f, 'item')
+def convert_jsonl_to_parquet(input_file: str, output_file: str):
+    """
+    将 JSONL 文件转换为 Parquet 格式，并过滤、重命名列。
+    - 保留 'func' 和 'target' 列
+    - 将 'target' 重命名为 'vul'
+    """
+    print(f"正在处理: {input_file} ...")
 
-        chunk = []
-        total_processed = 0
+    # 1. 读取 JSONL 文件
+    # lines=True 表示每一行都是一个独立的 JSON 对象
+    df = pd.read_json(input_file, lines=True)
 
-        for obj in objects:
-            # 提取并清洗数据
-            func = obj.get('func', "")
-            # 处理可能的 target -> vul 映射
-            vul = obj.get('vul', obj.get('target', 0))
+    # 2. 检查所需列是否存在
+    if 'func' not in df.columns or 'target' not in df.columns:
+        raise ValueError(f"文件 {input_file} 缺少必要的 'func' 或 'target' 列！当前列: {df.columns.tolist()}")
 
-            chunk.append({'func': func, 'vul': vul})
+    # 3. 过滤并重命名列
+    df = df[['func', 'target']]
+    df = df.rename(columns={'target': 'vul'})
 
-            if len(chunk) >= chunksize:
-                df = pd.DataFrame(chunk)
-                table = pa.Table.from_pandas(df, schema=schema)
+    # 4. 保存为 Parquet 格式 (使用 pyarrow 引擎)
+    df.to_parquet(output_file, engine='pyarrow', index=False)
 
-                if writer is None:
-                    writer = pq.ParquetWriter(output_file, schema)
-
-                writer.write_table(table)
-                total_processed += len(chunk)
-                print(f"已写入 {total_processed} 行...")
-                chunk = []  # 清空缓冲区
-
-        # 处理最后剩余的数据
-        if chunk:
-            df = pd.DataFrame(chunk)
-            table = pa.Table.from_pandas(df, schema=schema)
-            if writer is None:
-                writer = pq.ParquetWriter(output_file, schema)
-            writer.write_table(table)
-            total_processed += len(chunk)
-
-    if writer:
-        writer.close()
-    print(f"✅ 处理完成！总计: {total_processed} 行，保存至: {output_file}")
+    print(f"✅ 转换完成！已保存为: {output_file}")
+    print(f"   数据集大小: {len(df)} 条样本")
+    print("-" * 50)
 
 
 if __name__ == "__main__":
-    process_large_json_array("data/function.json", "data/test_binary.parquet")
+    # 假设你的数据集分别存放在以下路径，你可以根据实际情况修改
+    dataset_splits = ["train", "valid", "test"]
+
+    input_dir = "./data/alert"  # 你的 jsonl 文件夹路径
+    output_dir = "./data/alert"  # 输出的 parquet 文件夹路径
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for split in dataset_splits:
+        input_path = os.path.join(input_dir, f"{split}.jsonl")
+        output_path = os.path.join(output_dir, f"{split}.parquet")
+
+        if os.path.exists(input_path):
+            convert_jsonl_to_parquet(input_path, output_path)
+        else:
+            print(f"⚠️ 未找到文件: {input_path}，跳过。")

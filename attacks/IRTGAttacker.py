@@ -166,7 +166,7 @@ class IRTGAttacker:
             # =========================================================
             # [阶段 1] 全局 MLM 快速生成 (依据 lightweight 配置)
             # =========================================================
-            self._log(f" -> Running FULL MLM Generation (Gen: {self.top_k_mlm}, Keep: {self.mlm_top_n_keep})...")
+            self._log(f" -> Running FULL MLM Generation (Gen: {self.top_k_mlm}, Keep: {self.mlm_top_n_keep}), Nums: {len(batch_tasks)}...")
             t_mlm_start = time.time()
             mlm_full_pool = {}
 

@@ -293,8 +293,8 @@ class LightweightCandidateGenerator:
                 device)
 
             with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype):
-                outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
-                last_hidden = outputs.hidden_states[-1]
+                outputs = self.mlm_engine.model.roberta(**inputs)
+                last_hidden = outputs.last_hidden_state
 
             cached_p_tokens = {}
             for b_idx in range(len(batch_texts)):

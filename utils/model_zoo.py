@@ -133,14 +133,78 @@ class ModelZoo:
                     model_obj, _ = loader.load_model()
                     self.models[name] = {"type": "dual_head", "model_obj": model_obj}
                 else:
-                    print(f"[*] Loading standard HF classifier...")
-                    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-                    model = AutoModelForSequenceClassification.from_pretrained(path, trust_remote_code=True).to(
-                        self.device)
+                    print(f"[*] Loading standard HF classifier from {path}...")
+                    # 1. 直接拉取标准 tokenizer，保证绝对不出错
+                    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base", trust_remote_code=True)
+
+                    # 2. 找到实际的权重文件
+                    bin_path = os.path.join(path, "pytorch_model.bin")
+                    if not os.path.exists(bin_path):
+                        bin_path = os.path.join(path, "model.bin")
+
+                    if not os.path.exists(bin_path):
+                        raise FileNotFoundError(f"[!] Could not find any .bin file in {path}")
+
+                    # 3. 强行读取字典到内存
+                    print(f"[*] Reading raw state_dict from {bin_path}...")
+                    raw_state_dict = torch.load(bin_path, map_location=self.device)
+
+                    # 4. 🌟 绝对执行清洗：脱去 'encoder.' 帽子
+                    clean_state_dict = {}
+                    has_custom_prefix = False
+                    for key, value in raw_state_dict.items():
+                        if key.startswith("encoder."):
+                            has_custom_prefix = True
+                            clean_key = key[8:]  # 去掉 'encoder.'
+                        else:
+                            clean_key = key
+                        clean_state_dict[clean_key] = value
+
+                    if has_custom_prefix:
+                        print("[*] 🛡️ Detected 'encoder.' custom prefix! Keys have been successfully cleaned.")
+
+                    # =========================================================
+                    # 🌟 4.5 核心魔法：将 1D Sigmoid 分类头动态等价转换为 2D Softmax
+                    # =========================================================
+                    num_labels = 2 if self.eval_mode == "binary" else self.num_classes
+                    if num_labels == 2 and "classifier.out_proj.weight" in clean_state_dict:
+                        w = clean_state_dict["classifier.out_proj.weight"]
+                        b = clean_state_dict.get("classifier.out_proj.bias")
+
+                        if w.shape[0] == 1:
+                            print("[*] 🔧 Math Magic: Converting 1D Sigmoid head to 2D Softmax head...")
+                            # 构造 [0, 原权重] 以匹配 Softmax 逻辑
+                            zero_w = torch.zeros_like(w)
+                            clean_state_dict["classifier.out_proj.weight"] = torch.cat([zero_w, w], dim=0)
+
+                            if b is not None:
+                                zero_b = torch.zeros_like(b)
+                                clean_state_dict["classifier.out_proj.bias"] = torch.cat([zero_b, b], dim=0)
+                    # =========================================================
+
+                    # 5. 使用微软官方架构作为骨架
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        "microsoft/codebert-base",
+                        num_labels=num_labels,
+                        ignore_mismatched_sizes=True,
+                        trust_remote_code=True
+                    )
+
+                    # 5.2 原生 PyTorch 强行注入清洗并转换后的权重！
+                    missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+
+                    if len(missing) > 0 or len(unexpected) > 0:
+                        print(f"[*] Partial match. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+                    else:
+                        print("[*] ✅ Perfect Match! All custom weights mathematically aligned to HF standard!")
+
+                    model = model.to(self.device)
                     model.eval()
                     self.models[name] = {"type": "standard", "tokenizer": tokenizer, "model": model}
+                    print(f"[*] ✅ Successfully loaded {name} into ModelZoo!")
+
             except Exception as e:
-                print(f"[!] Error loading {name}: {e}")
+                print(f"[!] Error completely failed to load {name}: {e}")
 
     def _base_predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
         """Performs raw single-inference logic without smoothing or voting."""
