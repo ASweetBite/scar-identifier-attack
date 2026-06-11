@@ -520,7 +520,6 @@ def save_top_rename_plot(mapping_df, out_path, top_k=20):
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-
 import os
 import json
 import argparse
@@ -530,38 +529,46 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 
-# 导入你项目中的原生模块 (请根据实际路径微调)
+# 导入你项目中的原生模块
 from utils.ast_tools import IdentifierAnalyzer
 from utils.llm_loader import LocalLLMClient
 from utils.mlm_engine import MLMEngine
 from attacks.LightWeightCandidateGenerator import LightweightCandidateGenerator
 
-# 假设这些是你原本用来做常规分析的工具函数
 
+def normalize_code(code: str) -> str:
+    if not isinstance(code, str) or not code:
+        return ""
+
+    # 1. 修复由于错误 dump 导致的双重转义 (把字面的 \n 恢复成真正的换行)
+    # 如果代码里连一个真正的换行符都没有，但有文本 "\n"，说明它被双重转义了
+    if '\n' not in code and '\\n' in code:
+        code = code.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
+    # 2. 统一 Windows (\r\n) 和 UNIX (\n) 换行符，防止 SequenceMatcher 因为看不见的 \r 误判
+    code = code.replace("\r\n", "\n").replace("\r", "\n")
+
+    return code
 
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze identifier-level modification magnitude, Semantic Similarity, and PPL."
     )
-
-    parser.add_argument("--input_json", help="Path to adversarial results JSON/JSONL file")
+    parser.add_argument("--input_json", required=True, help="Path to adversarial results JSON/JSONL file")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to system config (YAML)")
     parser.add_argument("--out", default="rename_stealthiness_stats", help="Output directory")
     parser.add_argument("--sample-id-field", default=None, help="Optional field used as sample_id")
     parser.add_argument("--top-k", type=int, default=20, help="Top-K rename pairs to plot")
-
     args = parser.parse_args()
+
     os.makedirs(args.out, exist_ok=True)
 
     # =========================================================================
     # 1. 初始化引擎与配置 (与攻击主程序严格对齐)
     # =========================================================================
     print(f"[*] Loading config from {args.config}...")
-    try:
-        with open(args.config, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-    except FileNotFoundError:
-        parser.error(f"❌ Configuration file not found: {args.config}")
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
 
     print("\n[*] Initializing Deep Learning Engines for Strict Offline Evaluation...")
     lang = config.get('global', {}).get('lang', 'cpp')
@@ -573,7 +580,7 @@ def main():
     llm_name = config['models'].get('llm_generator', 'models/qwen2.5-1.5b-code')
     llm_client = LocalLLMClient(model_name=llm_name)
 
-    # 实例化 LightweightCandidateGenerator，为了复用它里面神级的辅助函数
+    # 实例化 Generator，直接复用其神级的特征池化与 AST 裁剪函数
     mlm_gen = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
         analyzer=analyzer,
@@ -582,7 +589,7 @@ def main():
     )
 
     # =========================================================================
-    # 2. 读取并解析样本记录
+    # 2. 读取并解析样本记录，提取精准的 AST 上下文
     # =========================================================================
     print(f"\n[*] Loading records from {args.input_json}...")
     records = load_json_records(args.input_json)
@@ -590,54 +597,69 @@ def main():
     all_metrics = []
     all_mapping_rows = []
 
-    # 用于批量计算的队列
-    ppl_orig_codes = []
-    ppl_adv_codes = []
-    ppl_record_indices = []
+    # 用于批量计算的特征存储池
+    sim_prefixes, sim_orig_vars, sim_adv_vars, sim_suffixes, sim_record_indices = [], [], [], [], []
+    ppl_orig_codes, ppl_adv_codes, ppl_record_indices = [], [], []
 
-    sim_prefixes = []
-    sim_orig_vars = []
-    sim_adv_vars = []
-    sim_suffixes = []
-    sim_record_indices = []
-
-    print("[*] Performing structural analysis and context slicing...")
+    print("[*] Performing structural analysis and AST-Bounded context slicing...")
     for idx, record in enumerate(records):
         sample_id = record.get(args.sample_id_field, idx) if args.sample_id_field else idx
+
+        # 1. 数据清洗 (保留上次加的补丁)
+        orig_code = normalize_code(record.get("original_code", ""))
+        adv_code = normalize_code(record.get("adversarial_code", ""))
+        record["original_code"] = orig_code
+        record["adversarial_code"] = adv_code
+
+        # 2. 严格读取数据集真实的 is_success
+        is_success = record.get("is_success", False)
+        if isinstance(is_success, str):
+            is_success = (is_success.lower() == 'true')
 
         # 原有的基础结构指标分析
         metrics, mapping_rows = analyze_one_record(record, sample_id)
 
-        orig_code = record.get("original_code", "")
-        adv_code = record.get("adversarial_code", "")
-        is_success = record.get("is_success", False)
+        # 🚀 将真实的攻击结果强行记录到本条数据的 metrics 中
+        metrics["is_success"] = is_success
 
-        if is_success and orig_code and adv_code:
-            # --- 收集 PPL 数据 (全局代码上下文) ---
+        # 初始化深度学习指标
+        metrics.update({
+            "semantic_similarity": np.nan, "orig_ppl": np.nan,
+            "adv_ppl": np.nan, "ppl_ratio": np.nan, "ppl_diff": np.nan
+        })
+
+        # 3. 只有真实判定为成功的样本，才去算它语义偏移了多少！
+        if is_success and orig_code and adv_code and orig_code != adv_code:
             ppl_orig_codes.append(orig_code)
             ppl_adv_codes.append(adv_code)
             ppl_record_indices.append(idx)
 
-            # --- 收集 Semantic Similarity 数据 (AST 语句级切片上下文) ---
+            # --- 下方提取 AST 标识符和相似度的代码保持原样 ---
+            # ... orig_bytes = orig_code.encode("utf-8") ...
+
+            # --- 🎯 严格对齐过滤逻辑的上下文切片 ---
             orig_bytes = orig_code.encode("utf-8")
             identifiers = analyzer.extract_identifiers(orig_bytes)
 
-            # 解析本次攻击替换了哪些变量 (从 mapping_rows 中提取对齐信息)
-            # 解析本次攻击替换了哪些变量 (直接从 JSONL 原生的 replaced_names 提取，绝对安全)
-            replaced_names = record.get("replaced_names", {})
+            # 2. 自动推断 replaced_names：如果 JSON 没提供，利用脚本自带的 Token 对齐结果动态推导
+            replaced_names = record.get("replaced_names")
+            if not replaced_names:
+                replaced_names = {}
+                for row in mapping_rows:
+                    # mapping_rows 是前面 analyze_one_record 通过算法算出来的修改记录
+                    old_name = row["old_identifier"]
+                    new_name = row["new_identifier"]
+                    replaced_names[old_name] = new_name
+
             for old_var, new_var in replaced_names.items():
-
-                # 确保提取出来的变量是个字符串，防范极端的脏数据
-                old_var = str(old_var)
-                new_var = str(new_var)
-
+                old_var, new_var = str(old_var), str(new_var)
                 if old_var in identifiers and old_var != new_var:
                     try:
-                        # 严格复用 _find_best_context_occurrence 获取最佳语境位置
+                        # 1. 寻找最高信息量语境 (完全一致)
                         best_occ_idx = mlm_gen._find_best_context_occurrence(orig_bytes, identifiers[old_var])
                         target_info = identifiers[old_var][best_occ_idx]
 
-                        # 严格复用 _extract_local_context_ast 获取精确语法切片
+                        # 2. 提取语句级安全切片 (完全一致)
                         local_prefix, local_suffix = mlm_gen._extract_local_context_ast(
                             orig_bytes, target_info['start'], target_info['end']
                         )
@@ -651,12 +673,7 @@ def main():
                         print(f"        [!] 解析变量上下文出错 {old_var}->{new_var}: {e}")
                         continue
         else:
-            # 失败的样本，深度学习指标赋 NaN
-            metrics["semantic_similarity"] = np.nan
-            metrics["orig_ppl"] = np.nan
-            metrics["adv_ppl"] = np.nan
-            metrics["ppl_ratio"] = np.nan
-            metrics["ppl_diff"] = np.nan
+            metrics.update({"semantic_similarity": np.nan, "orig_ppl": np.nan, "adv_ppl": np.nan, "ppl_ratio": np.nan, "ppl_diff": np.nan})
 
         all_metrics.append(metrics)
         all_mapping_rows.extend(mapping_rows)
@@ -665,40 +682,39 @@ def main():
     # 3. 严格一致的批量深度学习指标推理
     # =========================================================================
 
-    # 3.1 PPL 批量计算 (复用 Generator 中的 _calculate_perplexity_batch)
+    # 3.1 PPL 批量计算
     if ppl_orig_codes:
         ppl_bs = config.get('candidate_generation', {}).get('ppl_batch_size', 4)
         print(f"\n[*] Calculating Strict Perplexity for {len(ppl_orig_codes)} samples (Batch Size: {ppl_bs})...")
-
         batch_orig_ppls = mlm_gen._calculate_perplexity_batch(ppl_orig_codes, batch_size=ppl_bs)
         batch_adv_ppls = mlm_gen._calculate_perplexity_batch(ppl_adv_codes, batch_size=ppl_bs)
 
         for i, global_idx in enumerate(ppl_record_indices):
-            o_ppl = batch_orig_ppls[i]
-            a_ppl = batch_adv_ppls[i]
-            all_metrics[global_idx]["orig_ppl"] = float(o_ppl)
-            all_metrics[global_idx]["adv_ppl"] = float(a_ppl)
-            all_metrics[global_idx]["ppl_diff"] = float(a_ppl - o_ppl)
-            all_metrics[global_idx]["ppl_ratio"] = float(a_ppl / o_ppl) if o_ppl > 0 else float('inf')
+            all_metrics[global_idx].update({
+                "orig_ppl": float(batch_orig_ppls[i]),
+                "adv_ppl": float(batch_adv_ppls[i]),
+                "ppl_diff": float(batch_adv_ppls[i] - batch_orig_ppls[i]),
+                "ppl_ratio": float(batch_adv_ppls[i] / batch_orig_ppls[i]) if batch_orig_ppls[i] > 0 else float('inf')
+            })
 
-    # 3.2 变量级语义相似度批量计算 (复用 Generator 中的 _get_variable_token_embeddings)
+    # 3.2 🎯 语义相似度批量计算 (核心对齐区)
     if sim_prefixes:
-        print(f"[*] Calculating Strict Variable-Level Similarity for {len(sim_prefixes)} rename instances...")
+        print(f"[*] Calculating Target-Aware Token Similarity for {len(sim_prefixes)} rename instances...")
 
-        # 提取原始代码中特定变量 Token 的 Embedding
+        # 使用 _get_variable_token_embeddings 获取变量在语句切片中的均值池化特征
+        # 这个操作自动包含了混合精度 (AMP) 和精准 Token 对齐
         orig_embs = mlm_gen._get_variable_token_embeddings(
             sim_prefixes, sim_orig_vars, sim_suffixes, batch_size=64
         ).to(mlm_engine.device)
 
-        # 提取对抗代码中新变量 Token 的 Embedding
         adv_embs = mlm_gen._get_variable_token_embeddings(
             sim_prefixes, sim_adv_vars, sim_suffixes, batch_size=64
         ).to(mlm_engine.device)
 
-        # 进行严格的张量广播余弦相似度计算
+        # 完美的张量广播余弦相似度计算
         sims = F.cosine_similarity(orig_embs, adv_embs, dim=-1).cpu().numpy()
 
-        # 如果一个样本被替换了多个变量，我们要对其相似度取平均
+        # 聚合：如果一个样本替换了多个不同的变量，取其语义相似度的平均值
         sample_sim_accum = {}
         sample_sim_count = {}
         for i, global_idx in enumerate(sim_record_indices):
@@ -714,32 +730,36 @@ def main():
     # =========================================================================
     metrics_df = pd.DataFrame(all_metrics)
     mapping_df = pd.DataFrame(all_mapping_rows)
+    metrics_df.to_csv(os.path.join(args.out, "sample_metrics.csv"), index=False, encoding="utf-8-sig")
+    mapping_df.to_csv(os.path.join(args.out, "identifier_renames.csv"), index=False, encoding="utf-8-sig")
 
-    metrics_csv = os.path.join(args.out, "sample_metrics.csv")
-    mapping_csv = os.path.join(args.out, "identifier_renames.csv")
-    summary_json = os.path.join(args.out, "summary.json")
+    # 🚀 核心：划分出一个仅包含成功样本的 DataFrame
+    if "is_success" in metrics_df.columns:
+        success_df = metrics_df[metrics_df["is_success"] == True]
+    else:
+        success_df = metrics_df
 
-    metrics_df.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
-    mapping_df.to_csv(mapping_csv, index=False, encoding="utf-8-sig")
-
+    # 统计信息计算 (基于严格过滤的 success_df)
     summary = {
-        "num_samples": int(len(metrics_df)),
-        "num_successfully_changed_samples": int(
-            (metrics_df["changed_identifier_occurrences"] > 0).sum()) if not metrics_df.empty else 0,
-        "num_rename_pairs": int(len(mapping_df)),
+        "num_total_samples": int(len(metrics_df)),
+        "num_successfully_changed_samples": int(len(success_df)),
+        "success_rate": float(len(success_df) / max(len(metrics_df), 1)),
+        # 这里只统计成功样本中的重命名对数量
+        "num_rename_pairs_in_success": int(success_df["changed_identifier_occurrences"].sum()) if not success_df.empty else 0,
     }
 
     numeric_columns = [
         "token_modification_ratio", "identifier_occurrence_modification_ratio",
         "unique_identifier_modification_ratio", "relative_identifier_edit_to_function_chars",
-        "sequence_char_diff_ratio", "changed_line_ratio",
-        "avg_char_edit_ratio_weighted", "avg_subword_edit_ratio_weighted", "avg_subword_jaccard_distance_weighted",
+        "sequence_char_diff_ratio", "changed_line_ratio", "avg_char_edit_ratio_weighted",
+        "avg_subword_edit_ratio_weighted", "avg_subword_jaccard_distance_weighted",
         "semantic_similarity", "orig_ppl", "adv_ppl", "ppl_ratio", "ppl_diff"
     ]
 
+    # 🚀 注意：这里所有的 mean, median 计算都改为了使用 success_df
     for col in numeric_columns:
-        if col in metrics_df.columns and not metrics_df.empty:
-            valid_series = metrics_df[col].replace([np.inf, -np.inf], np.nan).dropna()
+        if col in success_df.columns and not success_df.empty:
+            valid_series = success_df[col].replace([np.inf, -np.inf], np.nan).dropna()
             if not valid_series.empty:
                 summary[col] = {
                     "mean": float(valid_series.mean()),
@@ -748,42 +768,21 @@ def main():
                     "max": float(valid_series.max()),
                 }
 
+    summary_json = os.path.join(args.out, "summary.json")
     with open(summary_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    if not metrics_df.empty:
-        # 原有的柱状图
-        save_histogram(metrics_df, "token_modification_ratio",
-                       os.path.join(args.out, "hist_token_modification_ratio.png"), "Token-level Modification Ratio",
-                       "Ratio")
+    # 生成直方图图表
+    if not metrics_df.empty and "semantic_similarity" in metrics_df.columns:
+        save_histogram(
+            metrics_df.dropna(subset=["semantic_similarity"]),
+            "semantic_similarity",
+            os.path.join(args.out, "hist_semantic_similarity.png"),
+            "Variable-Level Semantic Similarity (Target-Aware Token Pooling)",
+            "Similarity Score (1.0 = identical)"
+        )
 
-        # ✨ 新增：极其精准的变量级语义相似度图表
-        if "semantic_similarity" in metrics_df.columns:
-            save_histogram(
-                metrics_df.dropna(subset=["semantic_similarity"]),
-                "semantic_similarity",
-                os.path.join(args.out, "hist_semantic_similarity.png"),
-                "Variable-Level Semantic Similarity (CodeBERT Pool)",
-                "Similarity Score (1.0 = identical)"
-            )
-
-        # ✨ 新增：PPL Ratio 劣化率直方图
-        if "ppl_ratio" in metrics_df.columns:
-            # 过滤掉极端异常值以便画图更美观 (比如 ratio > 10 的截断)
-            plot_df = metrics_df.dropna(subset=["ppl_ratio"])
-            plot_df = plot_df[plot_df["ppl_ratio"] < 5.0]
-            save_histogram(
-                plot_df,
-                "ppl_ratio",
-                os.path.join(args.out, "hist_ppl_ratio.png"),
-                "Perplexity (PPL) Degradation Ratio",
-                "Adversarial PPL / Original PPL (Close to 1.0 is better)"
-            )
-
-    save_top_rename_plot(mapping_df, os.path.join(args.out, "top_identifier_renames.png"), top_k=args.top_k)
-
-    print(f"\n✅ Offline Stealthiness Evaluation Completed! Results saved to: {args.out}")
-
+    print(f"\n✅ 终极后置评估完成! {len(metrics_df)} 个样本成功分析。数据已保存至: {args.out}")
 
 if __name__ == "__main__":
     main()
