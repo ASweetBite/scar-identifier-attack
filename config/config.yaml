@@ -14,6 +14,7 @@ run_params:
   samples: 300
   dataset: "./data/alert/test.parquet"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
+  num_classes: 2
   use_majority_voting: false
 
 # ==========================================
@@ -23,8 +24,9 @@ models:
   mlm_engine: "microsoft/codebert-base-mlm"
   llm_generator: "models/qwen2.5-1.5b-code"
   target_models:
-    CodeBERT: "./models/ALERT_CodeBERT"
+#    CodeBERT: "./models/ALERT_CodeBERT"
     # GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
+    UniXcoder: "./models/UniXcoder_best_f1"
 
 # ==========================================
 # 4. Candidate Generation (MLM & LLM)
@@ -44,9 +46,6 @@ candidate_generation:
     top_k_mlm: 60
     top_n_keep: 50
     semantic_threshold: 0.87
-    fasttext_model_path: "./models/pretrained/fasttext_cpp.bin"
-    faiss_index_path: "./models/pretrained/faiss_cpp.index"
-    faiss_vocab_path: "./models/pretrained/vocab_cpp.json" # 修复了你原本的拼写错误
 
   # --- 重量级 (LLM) 专属配置 ---
   heavyweight:
