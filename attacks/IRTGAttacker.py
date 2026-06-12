@@ -328,7 +328,7 @@ class IRTGAttacker:
                     "original_prediction": orig_pred, "adversarial_prediction": adv_pred,
                     "is_success": is_success, "candidate_counts": json.dumps(candidate_counts, ensure_ascii=False),
                     "queries_consumed": queries_consumed,
-                    "attack_time_seconds": round(time.time() - t_atk_model_start, 2)
+                    "attack_time_seconds": round(current_shared_time + (time.time() - t_atk_model_start), 2)
                 }
                 storage_adv[atk_model].append(sample_record)
 

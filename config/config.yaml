@@ -11,7 +11,7 @@ global:
 # 2. Runtime & Dataset Parameters
 # ==========================================
 run_params:
-  samples: 300
+  samples: 200
   dataset: "./data/alert/test.parquet"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   num_classes: 2
@@ -24,9 +24,9 @@ models:
   mlm_engine: "microsoft/codebert-base-mlm"
   llm_generator: "models/qwen2.5-1.5b-code"
   target_models:
-#    CodeBERT: "./models/ALERT_CodeBERT"
-    # GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
-    UniXcoder: "./models/UniXcoder_best_f1"
+#   CodeBERT: "./models/ALERT_CodeBERT"
+    GraphCodeBERT: "./models/ALERT_GraphCodeBERT"
+#    UniXcoder: "./models/UniXcoder_best_f1"
 
 # ==========================================
 # 4. Candidate Generation (MLM & LLM)

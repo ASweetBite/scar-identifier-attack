@@ -15,7 +15,7 @@ from utils.dataset import DatasetLoader
 from utils.llm_loader import LocalLLMClient
 from utils.miner import NamingDataMiner
 from utils.mlm_engine import MLMEngine
-from utils.model_zoo import ModelZoo
+from utils.model_zoo import ModelZoo, CodeSmoother
 
 
 def main(args, config):
@@ -77,12 +77,13 @@ def main(args, config):
     # 4. 初始化周边组件
     # =========================================================================
     smoother_cfg = config['smoother']
+    smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
 
     model_configs = config['models'].get('target_models', {})
     model_zoo = ModelZoo(
         model_configs=model_configs,
         eval_mode=args.mode,
-        config=config
+        config=config,
     )
     transformer = CodeTransformer()
 
