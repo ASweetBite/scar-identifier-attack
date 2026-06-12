@@ -1,15 +1,8 @@
 import logging
-import os
 import random
-from collections import Counter
-from typing import List, Dict, Tuple, Union
-
-import numpy as np
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from typing import List, Dict
 
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
-from utils.bert_loader import CodeBERTModelLoader
 
 logger = logging.getLogger(__name__)
 
@@ -96,345 +89,327 @@ class CodeSmoother:
         return samples
 
 
+import os
+import json
+import torch
+import numpy as np
+from typing import Tuple, List
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from peft import PeftModel
+
 class ModelZoo:
-    def __init__(self, model_configs: dict, eval_mode: str, config: dict, smoother=None):
-        """Initializes the ModelZoo by batch loading target models and injecting the smoother."""
+    def __init__(self, model_configs: dict, eval_mode: str, config: dict):
         glob_cfg = config.get('global', {})
         run_cfg = config.get('run_params', {})
 
         self.device = torch.device(glob_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.eval_mode = eval_mode
-        self.num_classes = run_cfg.get('num_classes', 16)
         self.max_seq_len = run_cfg.get('max_seq_len', 512)
-        self.use_majority_voting = run_cfg.get('use_majority_voting', False)
+
+        if self.eval_mode == "binary":
+            self.num_classes = 2
+            print("[*] ModelZoo running in BINARY mode (Forcing num_classes = 2)")
+        else:
+            self.num_classes = run_cfg.get('num_classes', 16)
+            print(f"[*] ModelZoo running in MULTI mode (num_classes = {self.num_classes})")
 
         self.models = {}
         self.model_names = list(model_configs.keys())
-        self.smoother = smoother
+
+        # =====================================================================
+        # 1. 动态加载 DFG 特征提取器
+        # =====================================================================
+        self.analyzer = None
+        if any("graphcodebert" in name.lower() for name in self.model_names):
+            print("[*] Detected GraphCodeBERT in targets. Initializing DFG Extractor...")
+            self.analyzer = IdentifierAnalyzer(lang="cpp")
 
         for name, path in model_configs.items():
-            print(f"[*] Loading Model[{name}] from {path}...")
+            print(f"\n[*] Loading Model[{name}] from {path}...")
+
             if not os.path.exists(path):
-                print(f"[!] Path {path} not found. Skipping {name}.")
-                continue
+                raise FileNotFoundError(
+                    f"[!] CRITICAL: Target path {path} not found for model '{name}'. Aborting init.")
 
             try:
-                if os.path.exists(os.path.join(path, "dual_heads.pt")):
-                    print(f"[*] Dual-head model detected, initializing loader...")
-                    loader_cfg = {
-                        "model": {
-                            "model_name": path,
-                            "max_seq_len": self.max_seq_len,
-                            "device": str(self.device)
-                        },
-                        "data": {"num_classes": self.num_classes}
-                    }
-                    loader = CodeBERTModelLoader(loader_cfg)
-                    model_obj, _ = loader.load_model()
-                    self.models[name] = {"type": "dual_head", "model_obj": model_obj}
-                else:
-                    print(f"[*] Loading standard HF classifier from {path}...")
-                    # 1. 直接拉取标准 tokenizer，保证绝对不出错
-                    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base", trust_remote_code=True)
+                tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+                adapter_config_path = os.path.join(path, "adapter_config.json")
 
-                    # 2. 找到实际的权重文件
-                    bin_path = os.path.join(path, "pytorch_model.bin")
-                    if not os.path.exists(bin_path):
-                        bin_path = os.path.join(path, "model.bin")
+                if os.path.exists(adapter_config_path):
+                    print(f"    |- Detected LoRA adapter. Parsing base model config...")
+                    with open(adapter_config_path, 'r', encoding='utf-8') as f:
+                        peft_config = json.load(f)
 
-                    if not os.path.exists(bin_path):
-                        raise FileNotFoundError(f"[!] Could not find any .bin file in {path}")
+                    base_model_name = peft_config.get("base_model_name_or_path")
+                    if not base_model_name:
+                        raise ValueError(f"Missing 'base_model_name_or_path' in {adapter_config_path}")
 
-                    # 3. 强行读取字典到内存
-                    print(f"[*] Reading raw state_dict from {bin_path}...")
-                    raw_state_dict = torch.load(bin_path, map_location=self.device)
-
-                    # 4. 🌟 绝对执行清洗：脱去 'encoder.' 帽子
-                    clean_state_dict = {}
-                    has_custom_prefix = False
-                    for key, value in raw_state_dict.items():
-                        if key.startswith("encoder."):
-                            has_custom_prefix = True
-                            clean_key = key[8:]  # 去掉 'encoder.'
-                        else:
-                            clean_key = key
-                        clean_state_dict[clean_key] = value
-
-                    if has_custom_prefix:
-                        print("[*] 🛡️ Detected 'encoder.' custom prefix! Keys have been successfully cleaned.")
-
-                    # =========================================================
-                    # 🌟 4.5 核心魔法：将 1D Sigmoid 分类头动态等价转换为 2D Softmax
-                    # =========================================================
-                    num_labels = 2 if self.eval_mode == "binary" else self.num_classes
-                    if num_labels == 2 and "classifier.out_proj.weight" in clean_state_dict:
-                        w = clean_state_dict["classifier.out_proj.weight"]
-                        b = clean_state_dict.get("classifier.out_proj.bias")
-
-                        if w.shape[0] == 1:
-                            print("[*] 🔧 Math Magic: Converting 1D Sigmoid head to 2D Softmax head...")
-                            # 构造 [0, 原权重] 以匹配 Softmax 逻辑
-                            zero_w = torch.zeros_like(w)
-                            clean_state_dict["classifier.out_proj.weight"] = torch.cat([zero_w, w], dim=0)
-
-                            if b is not None:
-                                zero_b = torch.zeros_like(b)
-                                clean_state_dict["classifier.out_proj.bias"] = torch.cat([zero_b, b], dim=0)
-                    # =========================================================
-
-                    # 5. 使用微软官方架构作为骨架
-                    model = AutoModelForSequenceClassification.from_pretrained(
-                        "microsoft/codebert-base",
-                        num_labels=num_labels,
-                        ignore_mismatched_sizes=True,
+                    print(f"    |- Loading base model skeleton from: {base_model_name}")
+                    base_model = AutoModelForSequenceClassification.from_pretrained(
+                        base_model_name,
+                        num_labels=self.num_classes,
                         trust_remote_code=True
                     )
 
-                    # 5.2 原生 PyTorch 强行注入清洗并转换后的权重！
-                    missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+                    print(f"    |- Mounting LoRA weights and merging...")
+                    model = PeftModel.from_pretrained(base_model, path)
+                    model = model.merge_and_unload()
+                else:
+                    print(f"    |- Loading standard HF classifier skeleton...")
+                    # 先加载骨架 (忽略默认抛出的前缀不匹配警告)
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        path,
+                        num_labels=self.num_classes,
+                        trust_remote_code=True
+                    )
 
-                    if len(missing) > 0 or len(unexpected) > 0:
-                        print(f"[*] Partial match. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+                    # =========================================================
+                    # 🌟 核心恢复：底层权重拦截、去前缀与 1D -> 2D 维度对齐
+                    # =========================================================
+                    weight_path = os.path.join(path, "pytorch_model.bin")
+                    if not os.path.exists(weight_path):
+                        weight_path = os.path.join(path, "model.bin")
+
+                    if os.path.exists(weight_path):
+                        print(f"    |- Intercepting raw weights from {os.path.basename(weight_path)}...")
+                        raw_state_dict = torch.load(weight_path, map_location="cpu")
+
+                        clean_state_dict = {}
+                        has_custom_prefix = False
+
+                        # A. 动态清洗 'encoder.' 前缀
+                        for key, value in raw_state_dict.items():
+                            if key.startswith("encoder."):
+                                has_custom_prefix = True
+                                clean_key = key[8:]  # 剥离 'encoder.'
+                            else:
+                                clean_key = key
+                            clean_state_dict[clean_key] = value
+
+                        if has_custom_prefix:
+                            print("    |- 🛡️ Detected 'encoder.' prefix. Keys cleaned.")
+
+                        # B. Math Magic: 1D Sigmoid 转 2D Softmax
+                        if self.num_classes == 2 and "classifier.out_proj.weight" in clean_state_dict:
+                            w = clean_state_dict["classifier.out_proj.weight"]
+                            b = clean_state_dict.get("classifier.out_proj.bias")
+
+                            if w.shape[0] == 1:
+                                print("    |- 🔧 Math Magic: Converting 1D Sigmoid head to 2D Softmax head...")
+                                zero_w = torch.zeros_like(w)
+                                clean_state_dict["classifier.out_proj.weight"] = torch.cat([zero_w, w], dim=0)
+
+                                if b is not None:
+                                    zero_b = torch.zeros_like(b)
+                                    clean_state_dict["classifier.out_proj.bias"] = torch.cat([zero_b, b], dim=0)
+
+                        # C. 强制注入清洗后的权重
+                        missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
+
+                        # 验证注入结果：必须过滤掉分类头正常初始化的少量差异
+                        critical_missing = [k for k in missing if "classifier" not in k]
+                        if len(critical_missing) == 0:
+                            print("    |- ✅ Clean weights successfully injected. Matrix perfectly aligned.")
+                        else:
+                            print(f"    |- [!] Warning: {len(critical_missing)} critical keys are still missing!")
                     else:
-                        print("[*] ✅ Perfect Match! All custom weights mathematically aligned to HF standard!")
+                        print("    |- [!] No standard .bin weight file found. Relying strictly on HF auto-load.")
+                    # =========================================================
 
-                    model = model.to(self.device)
-                    model.eval()
-                    self.models[name] = {"type": "standard", "tokenizer": tokenizer, "model": model}
-                    print(f"[*] ✅ Successfully loaded {name} into ModelZoo!")
+                model.to(self.device)
+                model.eval()
+                self.models[name] = {"type": "transformer", "tokenizer": tokenizer, "model": model}
+                print(f"[+] Successfully loaded {name} to {self.device}")
 
             except Exception as e:
-                print(f"[!] Error completely failed to load {name}: {e}")
+                raise RuntimeError(f"Failed to load model '{name}' from path '{path}'. Execution halted.") from e
 
-    def _base_predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
-        """Performs raw single-inference logic without smoothing or voting."""
-        m = self.models.get(target_model)
-        if m is None: return [1.0, 0.0], -1
+    # =========================================================================
+    # 特征编码分发区 (Feature Encoding Dispatchers)
+    # =========================================================================
 
-        if m["type"] == "dual_head":
-            res = m["model_obj"].predict(code)
-            p_vuln = float(res["f_det"])
-            if p_vuln <= 0.5:
-                return [1.0 - p_vuln, p_vuln], -1
-            else:
-                if self.eval_mode == "binary":
-                    return [1.0 - p_vuln, p_vuln], 1
-                else:
-                    probs = res["f_cls"]
-                    return probs.tolist(), int(np.argmax(probs))
+    def _encode_graphcodebert(self, code: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """为 GraphCodeBERT 构建高维图特征：1D Tokens, 1D Position IDs, 2D Attention Mask"""
+        code_bytes = code.encode('utf-8')
+        dfg_nodes, dfg_to_code, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
+
+        text_tokens = tokenizer.tokenize(code)
+        text_tokens = text_tokens[:self.max_seq_len - 2 - len(dfg_nodes)]
+
+        total_tokens = [tokenizer.cls_token] + text_tokens + [tokenizer.sep_token] + dfg_nodes
+        input_ids = tokenizer.convert_tokens_to_ids(total_tokens)
+
+        text_len = len(text_tokens) + 2
+        position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)]
+        position_ids += [0 for _ in dfg_nodes]
+
+        seq_length = len(total_tokens)
+        attn_mask = np.zeros((seq_length, seq_length), dtype=bool)
+
+        attn_mask[:text_len, :text_len] = True
+
+        for idx, edges in enumerate(dfg_to_dfg):
+            node_idx_in_matrix = text_len + idx
+            for source_idx in edges:
+                if source_idx < len(dfg_nodes):
+                    source_idx_in_matrix = text_len + source_idx
+                    attn_mask[node_idx_in_matrix, source_idx_in_matrix] = True
+                    attn_mask[source_idx_in_matrix, node_idx_in_matrix] = True
+
+        # [修改 _encode_graphcodebert 的结尾部分]
+        pad_len = self.max_seq_len - seq_length
+        if pad_len > 0:
+            input_ids += [tokenizer.pad_token_id] * pad_len
+            position_ids += [tokenizer.pad_token_id] * pad_len
+
+            padded_attn_mask = np.zeros((self.max_seq_len, self.max_seq_len), dtype=bool)
+            padded_attn_mask[:seq_length, :seq_length] = attn_mask
         else:
-            inputs = m["tokenizer"](
-                code, return_tensors="pt", truncation=True, max_length=512, padding="max_length"
-            ).to(self.device)
+            input_ids = input_ids[:self.max_seq_len]
+            position_ids = position_ids[:self.max_seq_len]
+            padded_attn_mask = attn_mask[:self.max_seq_len, :self.max_seq_len]
 
-            with torch.no_grad():
-                outputs = m["model"](**inputs)
-                probs = torch.softmax(outputs.logits, dim=-1).squeeze().cpu().numpy().tolist()
-                pred_label = int(np.argmax(probs))
+        # =========================================================================
+        # 🌟 核心修复：将 2D 布尔掩码转换为 4D 浮点加法掩码，绕过 HF 的维度展开灾难
+        # =========================================================================
 
-                if self.eval_mode == "binary" and pred_label == 0:
-                    pred_label = -1
+        # 1. 转换为浮点型: 0.0 表示保留, -10000.0 表示阻断 (Mask掉)
+        float_mask = np.where(padded_attn_mask, 0.0, -10000.0)
 
-            return probs, pred_label
+        # 2. 扩维到 4D 形状: [Batch_size=1, Num_heads=1, Seq_Len, Seq_Len]
+        # 注意：Num_heads 设为 1，PyTorch 的广播机制会自动将其应用到所有的注意力头上
+        float_mask_4d = np.expand_dims(float_mask, axis=(0, 1))
 
-    def _base_batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
-        List[List[float]], List[int]]:
-        m = self.models.get(target_model)
-        if m is None: return [[1.0, 0.0]] * len(codes), [-1] * len(codes)
+        return (
+            torch.tensor([input_ids], dtype=torch.long),
+            # 必须使用与模型权重一致的 dtype (通常是 fp32 或 fp16)
+            torch.tensor(float_mask_4d, dtype=torch.float32),
+            torch.tensor([position_ids], dtype=torch.long)
+        )
 
-        if m["type"] == "dual_head":
-            res = m["model_obj"].batch_predict(codes, batch_size=batch_size)
-            f_det = res["f_det"]  # 假设是 (B,) 的漏洞概率
+    def _encode_unixcoder(self, code: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
+        """为 UniXcoder 构建特征：强制注入 <encoder-only> 控制符"""
+        tokens = tokenizer.tokenize(code)
+        tokens = tokens[:self.max_seq_len - 4]
 
-            final_probs = []
-            final_preds = []
+        mode_token = "<encoder-only>"
+        source_tokens = [tokenizer.bos_token, mode_token, tokenizer.eos_token] + tokens + [tokenizer.eos_token]
+        input_ids = tokenizer.convert_tokens_to_ids(source_tokens)
 
-            if self.eval_mode == "binary":
-                for p in f_det:
-                    p = float(p)
-                    final_probs.append([1.0 - p, p])
-                    final_preds.append(1 if p > 0.5 else -1)  # 🌟 修正为 -1
-            else:
-                f_cls = res["f_cls"]  # (B, num_classes)
-                for p_det, p_cls in zip(f_det, f_cls):
-                    p_det = float(p_det)
-                    final_probs.append(p_cls.tolist())
-                    # 🌟 只有检测头过关，才返回 CWE ID，否则返回 -1
-                    final_preds.append(int(np.argmax(p_cls)) if p_det > 0.5 else -1)
+        padding_length = self.max_seq_len - len(input_ids)
+        input_ids += [tokenizer.pad_token_id] * padding_length
+        attention_mask = [1] * (self.max_seq_len - padding_length) + [0] * padding_length
 
-            return final_probs, final_preds
-        else:
-            all_probs, all_preds = [], []
-            for i in range(0, len(codes), batch_size):
-                batch_codes = codes[i:i + batch_size]
-                inputs = m["tokenizer"](
-                    batch_codes, return_tensors="pt", truncation=True, max_length=512, padding="max_length"
-                ).to(self.device)
+        return (
+            torch.tensor([input_ids], dtype=torch.long),
+            torch.tensor([attention_mask], dtype=torch.long)
+        )
 
-                with torch.no_grad():
-                    outputs = m["model"](**inputs)
-                    probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
-                    probs = [probs.tolist()] if probs.ndim == 1 else probs.tolist()
-                    preds = [int(np.argmax(p)) for p in probs]
-
-                    if self.eval_mode == "binary":
-                        preds = [1 if p == 1 else -1 for p in preds]
-
-                    all_probs.extend(probs)
-                    all_preds.extend(preds)
-            return all_probs, all_preds
+    # =========================================================================
+    # 推断接口动态路由 (Prediction Dispatcher)
+    # =========================================================================
 
     def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
-        """Predicts the label for a single code snippet.
-        Applies Monte Carlo smoothing and majority voting.
-        If variance is high (adversarial attack detected), it silently canonicalizes the code
-        and forces a standard definitive prediction.
-        """
-        if self.use_majority_voting and self.smoother:
-            samples = self.smoother.generate_smoothed_samples(code)
-            probs_list, preds_list = self._base_batch_predict(samples, target_model,
-                                                              batch_size=self.smoother.batch_size)
+        m = self.models.get(target_model)
+        if m is None:
+            return [1.0, 0.0], -1
 
-            majority_class = Counter(preds_list).most_common(1)[0][0]
+        tokenizer = m["tokenizer"]
+        model = m["model"]
+        model_name_lower = target_model.lower()
 
-            majority_probs = [probs[majority_class] for probs in probs_list]
-            variance = float(np.var(majority_probs, ddof=1)) if len(samples) > 1 else 0.0
+        with torch.no_grad():
+            if "graphcodebert" in model_name_lower:
+                input_ids, attn_mask, position_ids = self._encode_graphcodebert(code, tokenizer)
+                outputs = model(
+                    input_ids=input_ids.to(self.device),
+                    attention_mask=attn_mask.to(self.device),
+                    position_ids=position_ids.to(self.device)
+                )
 
-            if variance > self.smoother.variance_threshold:
-                # 触发防御：静默去噪并强制输出标准结果
-                canonical_code = self.smoother.analyzer.canonicalize(code) if hasattr(self.smoother.analyzer,
-                                                                                      'canonicalize') else code
-                fallback_probs, fallback_pred = self._base_predict(canonical_code, target_model)
-                # 直接返回整数标签，对外隐藏防御动作
-                return fallback_probs, fallback_pred
+            elif "unixcoder" in model_name_lower:
+                input_ids, attn_mask = self._encode_unixcoder(code, tokenizer)
+                outputs = model(
+                    input_ids=input_ids.to(self.device),
+                    attention_mask=attn_mask.to(self.device)
+                )
 
-            avg_probs = np.mean(probs_list, axis=0).tolist()
-            return avg_probs, majority_class
+            else:
+                inputs = tokenizer(
+                    code, return_tensors="pt", truncation=True, max_length=self.max_seq_len, padding="max_length"
+                ).to(self.device)
+                outputs = model(**inputs)
 
-        return self._base_predict(code, target_model)
+            probs = torch.softmax(outputs.logits, dim=-1).squeeze(0).cpu().numpy().tolist()
+            pred_label = int(np.argmax(probs))
+
+            if self.eval_mode == "binary" and pred_label == 0:
+                pred_label = -1
+
+        return probs, pred_label
 
     def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
         List[List[float]], List[int]]:
-        """Predicts labels for a batch of code snippets using efficient flattened inference.
-        Ensures the output is always a valid list of probabilities and integer labels,
-        silently falling back to canonicalized code for high-variance samples.
-        """
-        if self.use_majority_voting and self.smoother:
-            all_samples = []
-            for code in codes:
-                all_samples.extend(self.smoother.generate_smoothed_samples(code))
-
-            all_probs, all_preds = self._base_batch_predict(all_samples, target_model, batch_size=batch_size)
-
-            final_probs = [[] for _ in range(len(codes))]
-            final_preds = [0 for _ in range(len(codes))]
-            num_samples = self.smoother.num_samples
-
-            fallback_indices = []
-            fallback_codes = []
-
-            for i in range(len(codes)):
-                start_idx = i * num_samples
-                end_idx = start_idx + num_samples
-
-                group_preds = all_preds[start_idx:end_idx]
-                group_probs = all_probs[start_idx:end_idx]
-
-                majority_class = Counter(group_preds).most_common(1)[0][0]
-
-                majority_probs = [probs[majority_class] for probs in group_probs]
-                variance = float(np.var(majority_probs, ddof=1)) if num_samples > 1 else 0.0
-
-                if variance > self.smoother.variance_threshold:
-                    # 记录需要兜底的索引，准备二次预测
-                    fallback_indices.append(i)
-                    canonical_code = self.smoother.analyzer.canonicalize(codes[i]) if hasattr(self.smoother.analyzer,
-                                                                                              'canonicalize') else \
-                    codes[i]
-                    fallback_codes.append(canonical_code)
-                else:
-                    final_preds[i] = majority_class
-                    final_probs[i] = np.mean(group_probs, axis=0).tolist()
-
-            # 对所有高方差样本进行批量的去噪预测
-            if fallback_codes:
-                fb_probs, fb_preds = self._base_batch_predict(fallback_codes, target_model, batch_size=batch_size)
-
-                # 将去噪后的结果以标准格式（float和int）回填
-                for idx, prob, pred in zip(fallback_indices, fb_probs, fb_preds):
-                    final_preds[idx] = pred
-                    final_probs[idx] = prob
-
-            return final_probs, final_preds
-
-        return self._base_batch_predict(codes, target_model, batch_size)
-    # def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
-    #     """
-    #     [纯标准化测试版]
-    #     仅对输入代码进行 AST 规范化去噪，然后进行单次预测。
-    #     用于测试模型在失去所有变量语义情况下的基础 F1 得分和原生防御力。
-    #     """
-    #     # 1. 强制进行代码规范化（抹除所有变量名/函数名）
-    #     canonical_code = self.smoother.analyzer.canonicalize(code) if self.smoother and hasattr(self.smoother.analyzer,
-    #                                                                                             'canonicalize') else code
-    #
-    #     # 2. 直接使用规范化后的代码进行单次预测（无平滑开销）
-    #     probs, pred = self._base_predict(canonical_code, target_model)
-    #
-    #     return probs, pred
-    #
-    # def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
-    #     List[List[float]], List[int]]:
-    #     """
-    #     [纯标准化测试版]
-    #     对批量输入的代码进行 AST 规范化去噪，然后进行高效扁平化推理。
-    #     """
-    #     if self.smoother and hasattr(self.smoother.analyzer, 'canonicalize'):
-    #         # 在 CPU 上极速批量处理规范化
-    #         canonical_codes = [self.smoother.analyzer.canonicalize(code) for code in codes]
-    #     else:
-    #         canonical_codes = codes
-    #
-    #     # 直接将全部规范化代码送入 GPU 进行批处理推理
-    #     return self._base_batch_predict(canonical_codes, target_model, batch_size=batch_size)
-
-    def predict_label_conf(self, code: str, label: int, target_model: str) -> float:
-        """Retrieves confidence for a specific label, inheriting the current prediction logic."""
-        probs, _ = self.predict(code, target_model)
-        return probs[label] if label < len(probs) else 0.0
-
-    def predict_with_rejection(self, code: str, target_model: str, candidate_dict: dict = None,
-                               sensitive_vars: list = None) -> Tuple[Union[int, str], float, float]:
-        """Predicts a label with a rejection mechanism for high-variance adversarial samples."""
-        if not self.smoother:
-            raise ValueError("[!] Smoother not initialized. Provide smoother_config and generator in ModelZoo.")
-
+        """安全的 Batch Predict: 兼容各种非标准架构的特征重组"""
         m = self.models.get(target_model)
         if m is None:
-            return 0, 0.0, 0.0
+            return [[1.0, 0.0]] * len(codes), [-1] * len(codes)
 
-        samples = self.smoother.generate_smoothed_samples(code, candidate_dict, sensitive_vars)
-        N = len(samples)
+        tokenizer = m["tokenizer"]
+        model = m["model"]
+        model_name_lower = target_model.lower()
 
-        if m["type"] == "dual_head":
-            res = m["model_obj"].batch_predict(samples, batch_size=self.smoother.batch_size)
-            f_det, f_cls = res["f_det"], res["f_cls"]
-            raw_probs = np.zeros((N, f_cls.shape[1] + 1))
-            raw_probs[:, 0] = 1.0 - f_det
-            raw_probs[:, 1:] = f_det[:, np.newaxis] * f_cls
-        else:
-            batch_probs, _ = self._base_batch_predict(samples, target_model, batch_size=self.smoother.batch_size)
-            raw_probs = np.array(batch_probs)
+        all_probs, all_preds = [], []
 
-        predictions = np.argmax(raw_probs, axis=1)
-        majority_class, count = Counter(predictions.tolist()).most_common(1)[0]
-        confidence = count / N
-        variance = float(np.var(raw_probs[:, majority_class], ddof=1)) if N > 1 else 0.0
+        for i in range(0, len(codes), batch_size):
+            batch_codes = codes[i:i + batch_size]
 
-        if variance > self.smoother.variance_threshold:
-            return "Reject_Adversarial", confidence, variance
+            with torch.no_grad():
+                if "graphcodebert" in model_name_lower:
+                    b_input_ids, b_attn_mask, b_position_ids = [], [], []
+                    for c in batch_codes:
+                        i_ids, a_mask, p_ids = self._encode_graphcodebert(c, tokenizer)
+                        b_input_ids.append(i_ids)
+                        b_attn_mask.append(a_mask)
+                        b_position_ids.append(p_ids)
 
-        if self.eval_mode == "binary" and majority_class > 0:
-            majority_class = 1
+                    outputs = model(
+                        input_ids=torch.cat(b_input_ids, dim=0).to(self.device),
+                        attention_mask=torch.cat(b_attn_mask, dim=0).to(self.device),
+                        position_ids=torch.cat(b_position_ids, dim=0).to(self.device)
+                    )
 
-        return int(majority_class), confidence, variance
+                elif "unixcoder" in model_name_lower:
+                    b_input_ids, b_attn_mask = [], []
+                    for c in batch_codes:
+                        i_ids, a_mask = self._encode_unixcoder(c, tokenizer)
+                        b_input_ids.append(i_ids)
+                        b_attn_mask.append(a_mask)
+
+                    outputs = model(
+                        input_ids=torch.cat(b_input_ids, dim=0).to(self.device),
+                        attention_mask=torch.cat(b_attn_mask, dim=0).to(self.device)
+                    )
+
+                else:
+                    inputs = tokenizer(
+                        batch_codes, return_tensors="pt", truncation=True, max_length=self.max_seq_len,
+                        padding="max_length"
+                    ).to(self.device)
+                    outputs = model(**inputs)
+
+                probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+                probs_list = probs.tolist() if probs.ndim == 2 else [probs.tolist()]
+                preds_list = [int(np.argmax(p)) for p in probs_list]
+
+                if self.eval_mode == "binary":
+                    preds_list = [1 if p == 1 else -1 for p in preds_list]
+
+                all_probs.extend(probs_list)
+                all_preds.extend(preds_list)
+
+        return all_probs, all_preds
+
+    def predict_label_conf(self, code: str, label: int, target_model: str) -> float:
+        probs, _ = self.predict(code, target_model)
+        return probs[label] if label < len(probs) else 0.0

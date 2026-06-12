@@ -84,7 +84,6 @@ def main(args, config):
         model_configs=model_configs,
         eval_mode=args.mode,
         config=config,
-        smoother=smoother
     )
     transformer = CodeTransformer()
 

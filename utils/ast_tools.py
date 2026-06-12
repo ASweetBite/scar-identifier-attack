@@ -1,6 +1,6 @@
 import re
 from collections import defaultdict
-from typing import Union
+from typing import Union, Tuple, List
 
 from tree_sitter import Language
 from tree_sitter import Parser
@@ -59,6 +59,102 @@ class IdentifierAnalyzer:
             self.ast_query = Query(self.language, query_str)
         except ImportError:
             self.ast_query = self.language.query(query_str)
+
+    def extract_dataflow(self, source_code: bytes) -> Tuple[List[str], List[Tuple[int, int]], List[List[int]]]:
+        """
+        Performs reaching definition analysis to generate DFG tailored for GraphCodeBERT.
+
+        Returns:
+            dfg_nodes: List of variable names involved in data flow.
+            dfg_to_code: List of byte range tuples (start, end) mapping DFG nodes back to source code.
+            dfg_to_dfg: List of lists containing the indices of incoming data flow edges.
+        """
+        parser = Parser()
+        parser.language = self.language
+        tree = parser.parse(source_code)
+
+        # 获取所有标识符及其位置 (复用底层查询)
+        if hasattr(self.ast_query, "captures"):
+            captures = self.ast_query.captures(tree.root_node)
+        else:
+            from tree_sitter import QueryCursor
+            cursor = QueryCursor(self.ast_query)
+            captures = cursor.captures(tree.root_node)
+
+        if isinstance(captures, dict):
+            flat_captures = [(n, t) for t, nodes in captures.items() for n in
+                             (nodes if isinstance(nodes, list) else [nodes])]
+        else:
+            flat_captures = list(captures)
+
+        flat_captures.sort(key=lambda x: (x[0].start_byte, -x[0].end_byte))
+
+        dfg_nodes = []
+        dfg_to_code = []
+        dfg_to_dfg = []
+
+        # 追踪每个变量上一次被写入时的 DFG 节点索引
+        # 结构: { "var_name": [node_index_1, node_index_2] }
+        last_write_state = defaultdict(list)
+        current_node_idx = 0
+
+        for node, tag in flat_captures:
+            if tag != "ident":
+                continue
+
+            name_bytes = source_code[node.start_byte:node.end_byte]
+            if name_bytes in self.keywords_bytes:
+                continue
+
+            name = name_bytes.decode("utf-8")
+
+            # 判断当前标识符是处于 Write (定值) 还是 Read (使用) 上下文
+            is_write = False
+            parent = node.parent
+            if parent:
+                # 左值赋值：a = b;
+                if parent.type == 'assignment_expression' and parent.child_by_field_name('left') == node:
+                    is_write = True
+                # 初始化声明：int a = 1;
+                elif parent.type == 'init_declarator' and parent.child_by_field_name('declarator') == node:
+                    is_write = True
+                # 参数声明：void func(int a)
+                elif parent.type == 'parameter_declaration' or parent.type == 'optional_parameter_declaration':
+                    is_write = True
+                # 自增/自减：a++ (既是 read 也是 write，这里标记为 write 阻断旧流)
+                elif parent.type == 'update_expression' and parent.child_by_field_name('argument') == node:
+                    is_write = True
+
+            # 将该变量注册为 DFG 节点
+            dfg_nodes.append(name)
+            dfg_to_code.append((node.start_byte, node.end_byte))
+
+            # 计算数据流依赖 (Data Flow Edges)
+            incoming_edges = []
+
+            if not is_write:
+                # 如果是 Read，数据来源于该变量上一次的 Write 节点
+                if name in last_write_state:
+                    incoming_edges.extend(last_write_state[name])
+            else:
+                # 如果是赋值操作的左值，比如 a = b;
+                # a 的数据来源于同语句右侧的所有 Read 节点。
+                # 为了简化并适配 GraphCodeBERT 格式，赋值操作阻断之前的流，并等待后续 AST 遍历完善
+                pass
+
+                # GraphCodeBERT 要求自身的边也包含在内（自环，保证注意力矩阵对角线连通）
+            incoming_edges.append(current_node_idx)
+
+            # 记录当前节点的连通边
+            dfg_to_dfg.append(list(set(incoming_edges)))
+
+            # 更新写入状态
+            if is_write:
+                last_write_state[name] = [current_node_idx]
+
+            current_node_idx += 1
+
+        return dfg_nodes, dfg_to_code, dfg_to_dfg
 
     def extract_identifiers(self, source_code: bytes) -> dict:
         """Traverses the AST to extract non-keyword identifiers and their scope information."""
