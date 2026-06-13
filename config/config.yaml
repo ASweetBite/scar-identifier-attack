@@ -24,9 +24,9 @@ models:
   mlm_engine: "microsoft/codebert-base-mlm"
   llm_generator: "models/qwen2.5-1.5b-code"
   target_models:
-#   CodeBERT: "./models/ALERT_CodeBERT"
-    GraphCodeBERT: "./models/ALERT_GraphCodeBERT"
-#    UniXcoder: "./models/UniXcoder_best_f1"
+    CodeBERT: "./models/CodeBERT_best_f1"
+    GraphCodeBERT: "./models/GraphCodeBERT_best_f1"
+    UniXcoder: "./models/UniXcoder_best_f1"
 
 # ==========================================
 # 4. Candidate Generation (MLM & LLM)
