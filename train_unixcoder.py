@@ -172,7 +172,7 @@ def train(model, train_dataset, eval_dataset, args):
 
             bar.set_postfix({"loss": round(loss.item() * args.gradient_accumulation_steps, 4)})
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -230,7 +230,13 @@ def main():
     eval_dataset = UniXcoderVulDataset(tokenizer, args.eval_data_file)
 
     # 3. Load Model & Inject LoRA
-    peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["query", "value"]
+    )
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         num_labels=2

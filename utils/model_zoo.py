@@ -229,60 +229,82 @@ class ModelZoo:
     # =========================================================================
 
     def _encode_graphcodebert(self, code: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """为 GraphCodeBERT 构建高维图特征：1D Tokens, 1D Position IDs, 2D Attention Mask"""
         code_bytes = code.encode('utf-8')
-        dfg_nodes, dfg_to_code, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
+        dfg_nodes, dfg_to_code_chars, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
 
-        text_tokens = tokenizer.tokenize(code)
-        text_tokens = text_tokens[:self.max_seq_len - 2 - len(dfg_nodes)]
+        # ====================================================================
+        # 🌟 关键对齐：严格匹配训练脚本 GraphCodeBERTVulDataset 的硬编码长度
+        # ====================================================================
+        args_code_length = 384
+        args_dfg_length = self.max_seq_len - args_code_length  # 128
 
-        total_tokens = [tokenizer.cls_token] + text_tokens + [tokenizer.sep_token] + dfg_nodes
-        input_ids = tokenizer.convert_tokens_to_ids(total_tokens)
+        # 1. 截断图节点 (对齐训练集)
+        dfg_nodes = dfg_nodes[:args_dfg_length]
+        dfg_to_code_chars = dfg_to_code_chars[:args_dfg_length]
+        dfg_to_dfg = [[e for e in edges if e < args_dfg_length] for edges in dfg_to_dfg[:args_dfg_length]]
 
-        text_len = len(text_tokens) + 2
-        position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)]
-        position_ids += [0 for _ in dfg_nodes]
+        if not getattr(tokenizer, "is_fast", False):
+            raise RuntimeError("[!] 必须加载 Fast 版本的 Tokenizer！")
 
-        seq_length = len(total_tokens)
-        attn_mask = np.zeros((seq_length, seq_length), dtype=bool)
+        # 2. 文本截断必须锁定 384 (对齐训练集)
+        encoded = tokenizer(
+            code,
+            truncation=True,
+            max_length=args_code_length,
+            return_offsets_mapping=True
+        )
+        text_ids = encoded['input_ids']
+        offsets = encoded['offset_mapping']
+        text_len = len(text_ids)
+
+        # 3. 构建 Subwords 映射
+        dfg_to_subwords = []
+        for (start_char, end_char) in dfg_to_code_chars:
+            subword_indices = []
+            for idx, (o_start, o_end) in enumerate(offsets):
+                if o_start == o_end: continue
+                if o_start < end_char and o_end > start_char:
+                    subword_indices.append(idx)
+            dfg_to_subwords.append(subword_indices)
+
+        # 4. 组装 IDs
+        input_ids = text_ids + [tokenizer.unk_token_id] * len(dfg_nodes)
+        position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)] + [0] * len(dfg_nodes)
+
+        # 5. Padding
+        pad_len = self.max_seq_len - len(input_ids)
+        input_ids += [tokenizer.pad_token_id] * pad_len
+        position_ids += [tokenizer.pad_token_id] * pad_len
+
+        # 6. 构建 Attention Mask
+        attn_mask = np.zeros((self.max_seq_len, self.max_seq_len), dtype=np.bool_)
 
         attn_mask[:text_len, :text_len] = True
 
-        for idx, edges in enumerate(dfg_to_dfg):
-            node_idx_in_matrix = text_len + idx
-            for source_idx in edges:
-                if source_idx < len(dfg_nodes):
-                    source_idx_in_matrix = text_len + source_idx
-                    attn_mask[node_idx_in_matrix, source_idx_in_matrix] = True
-                    attn_mask[source_idx_in_matrix, node_idx_in_matrix] = True
+        for idx, token_id in enumerate(input_ids):
+            if token_id in [tokenizer.cls_token_id, tokenizer.sep_token_id]:
+                attn_mask[idx, :text_len + len(dfg_nodes)] = True
+                attn_mask[:text_len + len(dfg_nodes), idx] = True
 
-        # [修改 _encode_graphcodebert 的结尾部分]
-        pad_len = self.max_seq_len - seq_length
-        if pad_len > 0:
-            input_ids += [tokenizer.pad_token_id] * pad_len
-            position_ids += [tokenizer.pad_token_id] * pad_len
+        for dfg_idx, subword_idxs in enumerate(dfg_to_subwords):
+            matrix_dfg_idx = text_len + dfg_idx
+            for sub_idx in subword_idxs:
+                attn_mask[matrix_dfg_idx, sub_idx] = True
+                attn_mask[sub_idx, matrix_dfg_idx] = True
 
-            padded_attn_mask = np.zeros((self.max_seq_len, self.max_seq_len), dtype=bool)
-            padded_attn_mask[:seq_length, :seq_length] = attn_mask
-        else:
-            input_ids = input_ids[:self.max_seq_len]
-            position_ids = position_ids[:self.max_seq_len]
-            padded_attn_mask = attn_mask[:self.max_seq_len, :self.max_seq_len]
+        for dfg_idx, edges in enumerate(dfg_to_dfg):
+            matrix_dfg_idx = text_len + dfg_idx
+            for source_dfg_idx in edges:
+                matrix_source_idx = text_len + source_dfg_idx
+                attn_mask[matrix_dfg_idx, matrix_source_idx] = True
+                attn_mask[matrix_source_idx, matrix_dfg_idx] = True
 
-        # =========================================================================
-        # 🌟 核心修复：将 2D 布尔掩码转换为 4D 浮点加法掩码，绕过 HF 的维度展开灾难
-        # =========================================================================
-
-        # 1. 转换为浮点型: 0.0 表示保留, -10000.0 表示阻断 (Mask掉)
-        float_mask = np.where(padded_attn_mask, 0.0, -10000.0)
-
-        # 2. 扩维到 4D 形状: [Batch_size=1, Num_heads=1, Seq_Len, Seq_Len]
-        # 注意：Num_heads 设为 1，PyTorch 的广播机制会自动将其应用到所有的注意力头上
+        # 7. 转换 4D Float 掩码
+        float_mask = np.where(attn_mask, 0.0, -10000.0).astype(np.float32)
         float_mask_4d = np.expand_dims(float_mask, axis=(0, 1))
 
         return (
             torch.tensor([input_ids], dtype=torch.long),
-            # 必须使用与模型权重一致的 dtype (通常是 fp32 或 fp16)
             torch.tensor(float_mask_4d, dtype=torch.float32),
             torch.tensor([position_ids], dtype=torch.long)
         )

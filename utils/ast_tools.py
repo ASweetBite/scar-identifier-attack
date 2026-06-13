@@ -6,54 +6,87 @@ from tree_sitter import Language
 from tree_sitter import Parser
 
 
+from tree_sitter import Language, Parser
+
 class IdentifierAnalyzer:
     def __init__(self, lang="cpp"):
         """Initializes the AST parser and sets up reserved keywords for the specified language."""
         if lang == "c":
             from tree_sitter_c import language as ts_c
             self.language = Language(ts_c())
+            query_str = """
+            [
+                (compound_statement)
+                (struct_specifier)
+                (function_definition)
+                (for_statement)
+            ] @scope
+
+            [
+                (identifier)
+                (field_identifier)
+            ] @ident
+            """
         elif lang == "cpp":
             from tree_sitter_cpp import language as ts_cpp
             self.language = Language(ts_cpp())
+            query_str = """
+            [
+                (compound_statement)
+                (class_specifier)
+                (namespace_definition)
+                (struct_specifier)
+                (function_definition)
+                (for_statement)
+            ] @scope
+
+            [
+                (identifier)
+                (field_identifier)
+            ] @ident
+            """
         else:
             raise ValueError("Unsupported language. Choose 'c' or 'cpp'.")
 
-        self.keywords = {
-            "int", "char", "float", "double", "void", "if", "else", "for", "while", "return",
-            "printf", "sizeof", "include", "main", "strcpy", "strlen", "malloc", "free",
-            "memset", "memcpy", "fopen", "fclose", "bool", "true", "false", "NULL",
-            "class", "public", "private", "protected", "template", "new", "delete",
-            "catch", "try", "namespace", "using", "cout", "cin", "std", "endl", "auto",
-            "const", "constexpr", "virtual", "override", "final", "this", "nullptr",
-            "string", "vector", "map", "set", "list", "cerr",
-            "static", "extern", "inline", "struct", "union", "enum", "typedef",
-            "short", "long", "unsigned", "signed", "register", "volatile",
-            "size_t", "ssize_t", "FILE", "DIR", "pid_t",
-            "int8_t", "uint8_t", "int16_t", "uint16_t",
-            "int32_t", "uint32_t", "int64_t", "uint64_t", "EOF"
-        }
+        # 官方 C/C++ 关键字、宏与特殊内置函数组合
+        c_keywords = [
+            "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern",
+            "float", "for", "goto", "if", "inline", "int", "long", "register", "restrict", "return", "short", "signed",
+            "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+            "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert",
+            "_Thread_local", "__func__"
+        ]
+        c_macros = [
+            "NULL", "_IOFBF", "_IOLBF", "BUFSIZ", "EOF", "FOPEN_MAX", "TMP_MAX", "FILENAME_MAX", "L_tmpnam",
+            "SEEK_CUR", "SEEK_END", "SEEK_SET", "EXIT_FAILURE", "EXIT_SUCCESS", "RAND_MAX", "MB_CUR_MAX"
+        ]
+        c_special_ids = [
+            "main", "stdio", "cstdio", "stdio.h", "size_t", "FILE", "fpos_t", "stdin", "stdout", "stderr",
+            "remove", "rename", "tmpfile", "tmpnam", "fclose", "fflush", "fopen", "freopen", "setbuf", "setvbuf",
+            "fprintf", "fscanf", "printf", "scanf", "snprintf", "sprintf", "sscanf", "vprintf", "vscanf", "vsnprintf",
+            "vsprintf", "vsscanf", "fgetc", "fgets", "fputc", "getc", "getchar", "putc", "putchar", "puts", "ungetc",
+            "fread", "fwrite", "fgetpos", "fseek", "fsetpos", "ftell", "rewind", "clearerr", "feof", "ferror", "perror",
+            "getline", "stdlib", "cstdlib", "stdlib.h", "div_t", "ldiv_t", "lldiv_t", "atof", "atoi", "atol", "atoll",
+            "strtod", "strtof", "strtold", "strtol", "strtoll", "strtoul", "strtoull", "rand", "srand", "aligned_alloc",
+            "calloc", "malloc", "realloc", "free", "abort", "atexit", "exit", "at_quick_exit", "_Exit", "getenv",
+            "quick_exit", "system", "bsearch", "qsort", "abs", "labs", "llabs", "div", "ldiv", "lldiv", "mblen", "mbtowc",
+            "wctomb", "mbstowcs", "wcstombs", "string", "cstring", "string.h", "memcpy", "memmove", "memchr", "memcmp",
+            "memset", "strcat", "strncat", "strchr", "strrchr", "strcmp", "strncmp", "strcoll", "strcpy", "strncpy",
+            "strerror", "strlen", "strspn", "strcspn", "strpbrk" ,"strstr", "strtok", "strxfrm", "memccpy", "mempcpy",
+            "strcat_s", "strcpy_s", "strdup", "strerror_r", "strlcat", "strlcpy", "strsignal", "strtok_r", "iostream",
+            "istream", "ostream", "fstream", "sstream", "iomanip", "iosfwd", "ios", "wios", "streamoff", "streampos",
+            "wstreampos", "streamsize", "cout", "cerr", "clog", "cin", "boolalpha", "noboolalpha", "skipws", "noskipws",
+            "showbase", "noshowbase", "showpoint", "noshowpoint", "showpos", "noshowpos", "unitbuf", "nounitbuf",
+            "uppercase", "nouppercase", "left", "right", "internal", "dec", "oct", "hex", "fixed", "scientific", "hexfloat",
+            "defaultfloat", "width", "fill", "precision", "endl", "ends", "flush", "ws", "sin", "cos", "tan", "asin",
+            "acos", "atan", "atan2", "sinh", "cosh", "tanh", "exp", "sqrt", "log", "log10", "pow", "powf", "ceil", "floor",
+            "fabs", "cabs", "frexp", "ldexp", "modf", "fmod", "hypot", "poly", "matherr"
+        ]
 
-        # [性能优化] 预先将 keywords 转换为 bytes，避免在遍历时对每个标识符进行耗时的 decode 操作
+        # 集合去重
+        self.keywords = set(c_keywords + c_macros + c_special_ids)
         self.keywords_bytes = {k.encode("utf-8") for k in self.keywords}
 
-        # [性能优化] 预编译 Tree-sitter S-expression Query
-        # 将原本需要在 Python 中递归的成千上万个节点，下放给底层的 C 引擎直接过滤出我们关心的节点
-        query_str = """
-        [
-            (compound_statement)
-            (class_specifier)
-            (namespace_definition)
-            (struct_specifier)
-            (function_definition)
-            (for_statement)
-        ] @scope
-
-        [
-            (identifier)
-            (field_identifier)
-        ] @ident
-        """
-        # 兼容新老版本的 tree-sitter python binding
         try:
             from tree_sitter import Query
             self.ast_query = Query(self.language, query_str)
@@ -61,19 +94,10 @@ class IdentifierAnalyzer:
             self.ast_query = self.language.query(query_str)
 
     def extract_dataflow(self, source_code: bytes) -> Tuple[List[str], List[Tuple[int, int]], List[List[int]]]:
-        """
-        Performs reaching definition analysis to generate DFG tailored for GraphCodeBERT.
-
-        Returns:
-            dfg_nodes: List of variable names involved in data flow.
-            dfg_to_code: List of byte range tuples (start, end) mapping DFG nodes back to source code.
-            dfg_to_dfg: List of lists containing the indices of incoming data flow edges.
-        """
         parser = Parser()
         parser.language = self.language
         tree = parser.parse(source_code)
 
-        # 获取所有标识符及其位置 (复用底层查询)
         if hasattr(self.ast_query, "captures"):
             captures = self.ast_query.captures(tree.root_node)
         else:
@@ -92,9 +116,6 @@ class IdentifierAnalyzer:
         dfg_nodes = []
         dfg_to_code = []
         dfg_to_dfg = []
-
-        # 追踪每个变量上一次被写入时的 DFG 节点索引
-        # 结构: { "var_name": [node_index_1, node_index_2] }
         last_write_state = defaultdict(list)
         current_node_idx = 0
 
@@ -106,49 +127,37 @@ class IdentifierAnalyzer:
             if name_bytes in self.keywords_bytes:
                 continue
 
-            name = name_bytes.decode("utf-8")
+            name = name_bytes.decode("utf-8", errors="replace")
 
-            # 判断当前标识符是处于 Write (定值) 还是 Read (使用) 上下文
             is_write = False
             parent = node.parent
             if parent:
-                # 左值赋值：a = b;
                 if parent.type == 'assignment_expression' and parent.child_by_field_name('left') == node:
                     is_write = True
-                # 初始化声明：int a = 1;
                 elif parent.type == 'init_declarator' and parent.child_by_field_name('declarator') == node:
                     is_write = True
-                # 参数声明：void func(int a)
-                elif parent.type == 'parameter_declaration' or parent.type == 'optional_parameter_declaration':
+                elif parent.type in ('parameter_declaration', 'optional_parameter_declaration'):
                     is_write = True
-                # 自增/自减：a++ (既是 read 也是 write，这里标记为 write 阻断旧流)
                 elif parent.type == 'update_expression' and parent.child_by_field_name('argument') == node:
                     is_write = True
 
-            # 将该变量注册为 DFG 节点
             dfg_nodes.append(name)
-            dfg_to_code.append((node.start_byte, node.end_byte))
 
-            # 计算数据流依赖 (Data Flow Edges)
+            # =========================================================
+            # 🌟 核心修改：将 Byte Offset 转换为 Char Offset，用于对接 HF
+            # =========================================================
+            start_char = len(source_code[:node.start_byte].decode("utf-8", errors="replace"))
+            end_char = len(source_code[:node.end_byte].decode("utf-8", errors="replace"))
+            dfg_to_code.append((start_char, end_char))
+
             incoming_edges = []
-
             if not is_write:
-                # 如果是 Read，数据来源于该变量上一次的 Write 节点
                 if name in last_write_state:
                     incoming_edges.extend(last_write_state[name])
-            else:
-                # 如果是赋值操作的左值，比如 a = b;
-                # a 的数据来源于同语句右侧的所有 Read 节点。
-                # 为了简化并适配 GraphCodeBERT 格式，赋值操作阻断之前的流，并等待后续 AST 遍历完善
-                pass
 
-                # GraphCodeBERT 要求自身的边也包含在内（自环，保证注意力矩阵对角线连通）
-            incoming_edges.append(current_node_idx)
-
-            # 记录当前节点的连通边
+            incoming_edges.append(current_node_idx)  # 自环
             dfg_to_dfg.append(list(set(incoming_edges)))
 
-            # 更新写入状态
             if is_write:
                 last_write_state[name] = [current_node_idx]
 

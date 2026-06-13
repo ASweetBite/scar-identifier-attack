@@ -40,96 +40,130 @@ def set_seed(seed=42):
 # =============== Dataset Definition (GraphCodeBERT 专属核心) ===============
 
 class GraphCodeBERTVulDataset(Dataset):
-    def __init__(self, tokenizer, parquet_path, max_len=512, lang="c"):
+    def __init__(self, tokenizer, parquet_path, max_len=512, lang="cpp"):
         self.examples = []
-        self.max_len = max_len
+        self.args_code_length = 384
+        self.args_dfg_length = max_len - self.args_code_length
+        self.tokenizer = tokenizer
+
+        # 必须确保是 Fast Tokenizer 才能开启 offsets_mapping
+        assert tokenizer.is_fast, "Must use a FastTokenizer for offset mapping!"
+
         logger.info(f"Loading dataset file at {parquet_path}")
 
         df = pd.read_parquet(parquet_path)
         df['label'] = df['vul'].astype(int)
-
-        # 基础截断过滤
         df = df[df['func'].str.len() <= 4000].copy()
 
         funcs = df['func'].tolist()
         labels = df['label'].tolist()
 
-        # 初始化 AST / DFG 提取器
-        logger.info("Initializing IdentifierAnalyzer for DFG extraction...")
+        # =========================================================
+        # 🌟 修复点 1：正确初始化我们重构后的 AST 分析器
+        # =========================================================
+        logger.info(f"Initializing Custom DFG Extractor for lang: {lang}...")
         self.analyzer = IdentifierAnalyzer(lang=lang)
 
-        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Extracting DFG & Tokenizing"):
+        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Building GraphCodeBERT Features"):
             try:
-                # 1. 提取 DFG 特征
+                # 1. 提取图拓扑 (传入 bytes)
                 code_bytes = func.encode('utf-8')
-                dfg_nodes, dfg_to_code, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
+                dfg_nodes, dfg_to_code_chars, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
 
-                # 2. Tokenize 文本并预留空间
-                text_tokens = tokenizer.tokenize(func)
-                text_tokens = text_tokens[:max_len - 2 - len(dfg_nodes)]
+                # 2. 文本编码并提取 Subword 级别的位置映射
+                encoded = tokenizer(
+                    func,
+                    truncation=True,
+                    max_length=self.args_code_length,
+                    return_offsets_mapping=True  # 🌟 神级功能：返回每个 Token 在原字符串中的起始结束位置
+                )
+                text_ids = encoded['input_ids']
+                offsets = encoded['offset_mapping']
+                text_len = len(text_ids)
 
-                total_tokens = [tokenizer.cls_token] + text_tokens + [tokenizer.sep_token] + dfg_nodes
-                input_ids = tokenizer.convert_tokens_to_ids(total_tokens)
+                # 3. 将变量的 Char Offset 映射到被切碎的 Subword Indices
+                dfg_to_subwords = []
+                for (start_char, end_char) in dfg_to_code_chars:
+                    subword_indices = []
+                    for idx, (o_start, o_end) in enumerate(offsets):
+                        if o_start == o_end: continue  # 过滤特殊 token 的空白映射
+                        if o_start < end_char and o_end > start_char:  # 判断区间有交集
+                            subword_indices.append(idx)
+                    dfg_to_subwords.append(subword_indices)
 
-                # 3. 构造位置编码 (Position IDs)
-                text_len = len(text_tokens) + 2
-                position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)]
-                position_ids += [0 for _ in dfg_nodes]
+                # 4. 根据 args_dfg_length 截断图谱
+                dfg_nodes = dfg_nodes[:self.args_dfg_length]
+                dfg_to_subwords = dfg_to_subwords[:self.args_dfg_length]
+                # 切断指向被截断节点的边
+                dfg_to_dfg = [[e for e in edges if e < self.args_dfg_length] for edges in
+                              dfg_to_dfg[:self.args_dfg_length]]
 
-                # 4. 构造 2D 注意力掩码
-                seq_length = len(total_tokens)
-                attn_mask = np.zeros((seq_length, seq_length), dtype=bool)
+                # 5. 组装输入序列 (完全符合微软官方：DFG 转 <unk>，Position 为 0)
+                input_ids = text_ids + [tokenizer.unk_token_id] * len(dfg_nodes)
+                position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)] + [0] * len(dfg_nodes)
 
-                # a. 文本互相可见
+                # 6. Padding
+                pad_len = max_len - len(input_ids)
+                input_ids += [tokenizer.pad_token_id] * pad_len
+                position_ids += [tokenizer.pad_token_id] * pad_len
+
+                # 7. 构建完美官方对齐的 2D 注意力矩阵
+                attn_mask = np.zeros((max_len, max_len), dtype=np.bool_)
+
+                # a. 代码 Token 相互可见
                 attn_mask[:text_len, :text_len] = True
 
-                # b. DFG 节点连通性
-                for idx, edges in enumerate(dfg_to_dfg):
-                    node_idx_in_matrix = text_len + idx
-                    for source_idx in edges:
-                        if source_idx < len(dfg_nodes):
-                            source_idx_in_matrix = text_len + source_idx
-                            attn_mask[node_idx_in_matrix, source_idx_in_matrix] = True
-                            attn_mask[source_idx_in_matrix, node_idx_in_matrix] = True
+                # b. 🌟 CLS 和 SEP 全局视野 (避免梯度回传丢失)
+                for idx, token_id in enumerate(input_ids):
+                    if token_id in [tokenizer.cls_token_id, tokenizer.sep_token_id]:
+                        attn_mask[idx, :text_len + len(dfg_nodes)] = True
+                        attn_mask[:text_len + len(dfg_nodes), idx] = True
 
-                # 5. Padding 补齐
-                pad_len = max_len - seq_length
-                if pad_len > 0:
-                    input_ids += [tokenizer.pad_token_id] * pad_len
-                    position_ids += [tokenizer.pad_token_id] * pad_len
+                # c. DFG 节点与对应的 Subword 互相可见
+                for dfg_idx, subword_idxs in enumerate(dfg_to_subwords):
+                    matrix_dfg_idx = text_len + dfg_idx
+                    for sub_idx in subword_idxs:
+                        attn_mask[matrix_dfg_idx, sub_idx] = True
+                        attn_mask[sub_idx, matrix_dfg_idx] = True
 
-                    padded_attn_mask = np.zeros((max_len, max_len), dtype=bool)
-                    padded_attn_mask[:seq_length, :seq_length] = attn_mask
-                else:
-                    input_ids = input_ids[:max_len]
-                    position_ids = position_ids[:max_len]
-                    padded_attn_mask = attn_mask[:max_len, :max_len]
+                # d. DFG 节点之间基于数据流依赖可见
+                for dfg_idx, edges in enumerate(dfg_to_dfg):
+                    matrix_dfg_idx = text_len + dfg_idx
+                    for source_dfg_idx in edges:
+                        matrix_source_idx = text_len + source_dfg_idx
+                        attn_mask[matrix_dfg_idx, matrix_source_idx] = True
+                        attn_mask[matrix_source_idx, matrix_dfg_idx] = True
 
-                # 6. 🌟 核心修复：转换为 3D 浮点掩码 (1, max_len, max_len)
-                # DataLoader 会自动将 batch 个 (1, L, L) 堆叠成 (B, 1, L, L)，完美契合 Hugging Face
-                float_mask = np.where(padded_attn_mask, 0.0, -10000.0)
-                float_mask_3d = np.expand_dims(float_mask, axis=0)
-
+                # 8. 以极低内存消耗保存
                 self.examples.append({
                     "input_ids": input_ids,
-                    "attention_mask": float_mask_3d,
+                    "attention_mask": attn_mask,  # np.bool_
                     "position_ids": position_ids,
                     "label": label
                 })
 
             except Exception as e:
-                # 极少数 AST 解析彻底崩溃的代码直接丢弃
-                continue
+                import traceback
+                print(f"\n[!] 🚨 提取特征时发生崩溃！")
+                print(f"[-] 当前报错: {e}")
+                traceback.print_exc()
+                raise e
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, item):
         example = self.examples[item]
+
+        # 惰性浮点 3D 掩码转换，完美规避 OOM 和 HF Expand 报错
+        bool_mask = example['attention_mask']
+        float_mask = np.where(bool_mask, 0.0, -10000.0).astype(np.float32)
+        float_mask_3d = np.expand_dims(float_mask, axis=0)
+
         return (
             torch.tensor(example['input_ids'], dtype=torch.long),
-            torch.tensor(example['attention_mask'], dtype=torch.float32),  # 注意是 float32
-            torch.tensor(example['position_ids'], dtype=torch.long),  # 新增 position_ids
+            torch.tensor(float_mask_3d, dtype=torch.float32),
+            torch.tensor(example['position_ids'], dtype=torch.long),
             torch.tensor(example['label'], dtype=torch.long)
         )
 
@@ -230,7 +264,7 @@ def train(model, train_dataset, eval_dataset, args):
 
             bar.set_postfix({"loss": round(loss.item() * args.gradient_accumulation_steps, 4)})
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_dataloader):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -284,13 +318,11 @@ def main():
     # 1. Load Tokenizer (移除不必要的 UniXcoder 特殊 Token)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
-    # 2. Preprocess Data with DFG Extraction
-    # 假设语言为 C/C++。若是 Python，需在内部指定 lang="python"
-    train_dataset = GraphCodeBERTVulDataset(tokenizer, args.train_data_file, lang="c")
-    eval_dataset = GraphCodeBERTVulDataset(tokenizer, args.eval_data_file, lang="c")
+    train_dataset = GraphCodeBERTVulDataset(tokenizer, args.train_data_file, lang="cpp")
+    eval_dataset = GraphCodeBERTVulDataset(tokenizer, args.eval_data_file, lang="cpp")
 
     # 3. Load Model & Inject LoRA
-    peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
+    peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1,target_modules=["query", "value"])
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         num_labels=2,
