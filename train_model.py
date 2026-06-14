@@ -133,8 +133,13 @@ def train(model_name, model, train_dataset, eval_dataset, cfg):
     ]
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=cfg["learning_rate"], eps=1e-8)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=t_total)
+    warmup_steps = int(t_total * 0.1)  # 🌟 算出总步数的 10% 作为预热
 
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,  # 🌟 把这里的 0 换成 warmup_steps
+        num_training_steps=t_total
+    )
     logger.info(f"***** Running training for {model_name} *****")
 
     best_f1 = 0.0
@@ -184,8 +189,8 @@ def train(model_name, model, train_dataset, eval_dataset, cfg):
 def main():
     # 📌 写死所有的超参数和数据路径，方便直接跑
     cfg = {
-        "train_data_file": "data/alert/train.parquet",  # 替换为你的真实路径
-        "eval_data_file": "data/alert/valid.parquet",  # 替换为你的真实路径
+        "train_data_file": "data/diverse/train.parquet",  # 替换为你的真实路径
+        "eval_data_file": "data/diverse/valid.parquet",  # 替换为你的真实路径
         "output_dir": "./models",
         "train_batch_size": 16,
         "eval_batch_size": 16,
@@ -205,7 +210,7 @@ def main():
         # "UniXcoder": "microsoft/unixcoder-base"
     }
 
-    peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
+    peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1,target_modules=["query", "value"],modules_to_save=["classifier"])
 
     for model_name, model_path in models_to_train.items():
         logger.info("\n" + "=" * 50)

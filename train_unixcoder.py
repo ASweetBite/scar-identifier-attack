@@ -146,8 +146,13 @@ def train(model, train_dataset, eval_dataset, args):
     ]
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=1e-8)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=t_total)
+    warmup_steps = int(t_total * 0.1)  # 🌟 算出总步数的 10% 作为预热
 
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,  # 🌟 把这里的 0 换成 warmup_steps
+        num_training_steps=t_total
+    )
     logger.info(f"***** Running training for {args.model_name} *****")
 
     best_f1 = 0.0
@@ -235,7 +240,8 @@ def main():
         r=8,
         lora_alpha=32,
         lora_dropout=0.1,
-        target_modules=["query", "value"]
+        target_modules=["query", "value"],
+        modules_to_save=["classifier"]
     )
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
