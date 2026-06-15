@@ -136,6 +136,9 @@ class ModelZoo:
                 adapter_config_path = os.path.join(path, "adapter_config.json")
 
                 if os.path.exists(adapter_config_path):
+                    # =========================================================
+                    # [分支 A]: 加载你训练的 LoRA 模型 (带独立分类头)
+                    # =========================================================
                     print(f"    |- Detected LoRA adapter. Parsing base model config...")
                     with open(adapter_config_path, 'r', encoding='utf-8') as f:
                         peft_config = json.load(f)
@@ -148,74 +151,32 @@ class ModelZoo:
                     base_model = AutoModelForSequenceClassification.from_pretrained(
                         base_model_name,
                         num_labels=self.num_classes,
-                        trust_remote_code=True
+                        trust_remote_code=True,
+                        ignore_mismatched_sizes=True  # 🌟 必须开启：允许分类头尺寸自适应重塑
                     )
 
-                    print(f"    |- Mounting LoRA weights and merging...")
+                    print(f"    |- Mounting LoRA weights and Custom Classifier...")
+                    # 🌟 必须直接保留 PeftModel 包装器，绝不调用 merge_and_unload()
+                    # 这样才能保住你用 modules_to_save=["classifier"] 辛苦训练出来的全连接层
                     model = PeftModel.from_pretrained(base_model, path)
-                    model = model.merge_and_unload()
+                    print("    |- ✅ LoRA and Classifier successfully mounted.")
+
                 else:
-                    print(f"    |- Loading standard HF classifier skeleton...")
-                    # 先加载骨架 (忽略默认抛出的前缀不匹配警告)
+                    # =========================================================
+                    # [分支 B]: 加载标准的全量 HuggingFace 模型 (不带 LoRA)
+                    # =========================================================
+                    print(f"    |- Loading standard HF classifier...")
+                    # 彻底删除了手动拦截 weights、去前缀、1D转2D 的历史遗留逻辑
+                    # 直接信任 HuggingFace 的原生加载能力
                     model = AutoModelForSequenceClassification.from_pretrained(
                         path,
                         num_labels=self.num_classes,
-                        trust_remote_code=True
+                        trust_remote_code=True,
+                        ignore_mismatched_sizes=True
                     )
+                    print("    |- ✅ Standard model loaded successfully.")
 
-                    # =========================================================
-                    # 🌟 核心恢复：底层权重拦截、去前缀与 1D -> 2D 维度对齐
-                    # =========================================================
-                    weight_path = os.path.join(path, "pytorch_model.bin")
-                    if not os.path.exists(weight_path):
-                        weight_path = os.path.join(path, "model.bin")
-
-                    if os.path.exists(weight_path):
-                        print(f"    |- Intercepting raw weights from {os.path.basename(weight_path)}...")
-                        raw_state_dict = torch.load(weight_path, map_location="cpu")
-
-                        clean_state_dict = {}
-                        has_custom_prefix = False
-
-                        # A. 动态清洗 'encoder.' 前缀
-                        for key, value in raw_state_dict.items():
-                            if key.startswith("encoder."):
-                                has_custom_prefix = True
-                                clean_key = key[8:]  # 剥离 'encoder.'
-                            else:
-                                clean_key = key
-                            clean_state_dict[clean_key] = value
-
-                        if has_custom_prefix:
-                            print("    |- 🛡️ Detected 'encoder.' prefix. Keys cleaned.")
-
-                        # B. Math Magic: 1D Sigmoid 转 2D Softmax
-                        if self.num_classes == 2 and "classifier.out_proj.weight" in clean_state_dict:
-                            w = clean_state_dict["classifier.out_proj.weight"]
-                            b = clean_state_dict.get("classifier.out_proj.bias")
-
-                            if w.shape[0] == 1:
-                                print("    |- 🔧 Math Magic: Converting 1D Sigmoid head to 2D Softmax head...")
-                                zero_w = torch.zeros_like(w)
-                                clean_state_dict["classifier.out_proj.weight"] = torch.cat([zero_w, w], dim=0)
-
-                                if b is not None:
-                                    zero_b = torch.zeros_like(b)
-                                    clean_state_dict["classifier.out_proj.bias"] = torch.cat([zero_b, b], dim=0)
-
-                        # C. 强制注入清洗后的权重
-                        missing, unexpected = model.load_state_dict(clean_state_dict, strict=False)
-
-                        # 验证注入结果：必须过滤掉分类头正常初始化的少量差异
-                        critical_missing = [k for k in missing if "classifier" not in k]
-                        if len(critical_missing) == 0:
-                            print("    |- ✅ Clean weights successfully injected. Matrix perfectly aligned.")
-                        else:
-                            print(f"    |- [!] Warning: {len(critical_missing)} critical keys are still missing!")
-                    else:
-                        print("    |- [!] No standard .bin weight file found. Relying strictly on HF auto-load.")
-                    # =========================================================
-
+                # 将模型推至设备并开启评估模式
                 model.to(self.device)
                 model.eval()
                 self.models[name] = {"type": "transformer", "tokenizer": tokenizer, "model": model}

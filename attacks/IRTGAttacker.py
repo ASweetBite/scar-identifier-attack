@@ -90,6 +90,7 @@ class IRTGAttacker:
     def attack(self, dataset: List[Dict]):
         self.attack_logs = []
 
+        # 统计面板初始化
         stats = {atk: {vic: {"total": 0, "fooled": 0, "success_queries": []} for vic in self.model_names} for atk in
                  self.model_names}
         storage_orig = {m: [] for m in self.model_names}
@@ -124,6 +125,7 @@ class IRTGAttacker:
             orig_predictions = {}
             has_correct_pred = False
 
+            # 获取所有模型对干净样本的初始预测
             for m in self.model_names:
                 probs, pred = self.model_zoo.predict(code, m)
                 orig_predictions[m] = {"probs": probs, "pred": pred}
@@ -164,9 +166,10 @@ class IRTGAttacker:
             self._log(f"    [Time] AST Folding & Setup took {time.time() - t_ast_start:.2f}s")
 
             # =========================================================
-            # [阶段 1] 全局 MLM 快速生成 (依据 lightweight 配置)
+            # [阶段 1] 全局 MLM 快速生成 (纯静态代码驱动，安全共享)
             # =========================================================
-            self._log(f" -> Running FULL MLM Generation (Gen: {self.top_k_mlm}, Keep: {self.mlm_top_n_keep}), Nums: {len(batch_tasks)}...")
+            self._log(
+                f" -> Running FULL MLM Generation (Gen: {self.top_k_mlm}, Keep: {self.mlm_top_n_keep}), Nums: {len(batch_tasks)}...")
             t_mlm_start = time.time()
             mlm_full_pool = {}
 
@@ -188,29 +191,27 @@ class IRTGAttacker:
             if not variables: continue
 
             batch_tasks_by_var = {task["target_name"]: task for task in batch_tasks}
-            sample_llm_cache = {v: [] for v in variables}
-            deep_enrich_attempts = {v: 0 for v in variables}
 
             # =========================================================
-            # [阶段 2] LLM 探针浅层试探 (依据 irtg.llm_probe_quota)
+            # [阶段 2] LLM 探针浅层试探 (纯静态代码驱动，作为基础安全共享)
             # =========================================================
             self._log(f" -> Running LLM Shallow Probe (Quota: {self.llm_probe_quota} cands/var)...")
             t_probe_start = time.time()
+            base_llm_probe_pool = {}
             try:
-                llm_probe_pool = self.llm_gen.generate_candidates(batch_tasks, target_quota=self.llm_probe_quota)
-                for var, cands in llm_probe_pool.items():
-                    if var in sample_llm_cache:
-                        sample_llm_cache[var] = list(set(cands))
+                base_llm_probe_pool = self.llm_gen.generate_candidates(batch_tasks, target_quota=self.llm_probe_quota)
             finally:
                 gc.collect()
                 if torch.cuda.is_available(): torch.cuda.empty_cache()
             self._log(f"    [Time] LLM Probe Generation took {time.time() - t_probe_start:.2f}s")
 
-            # 构建初期混合评估池
-            rnns_eval_pool = self._merge_candidate_pools(mlm_full_pool, sample_llm_cache, final_quota=self.total_quota)
+            # 结算当前样本的“公共预处理时间”
             current_shared_time = time.time() - t_shared_start
             sample_attacked_by_any = False
 
+            # =========================================================
+            # 模型攻击循环开始 (严格的环境隔离)
+            # =========================================================
             for atk_model in self.model_names:
                 t_atk_model_start = time.time()
 
@@ -223,8 +224,16 @@ class IRTGAttacker:
                 stats[atk_model][atk_model]["total"] += 1
                 self.model_zoo.reset_counter()
 
+                # 🌟 核心修复点：为每个模型独立分配 Cache (继承纯净的 Base 探针数据)
+                model_llm_cache = {v: list(set(base_llm_probe_pool.get(v, []))) for v in variables}
+                model_enrich_attempts = {v: 0 for v in variables}
+
+                # 构建针对当前模型的初期混合评估池
+                rnns_eval_pool = self._merge_candidate_pools(mlm_full_pool, model_llm_cache,
+                                                             final_quota=self.total_quota)
+
                 # =========================================================
-                # [阶段 3] 第一次 RNNS (筛选目标变量) 依据 irtg.top_k
+                # [阶段 3] RNNS (基于当前模型的梯度/重要性筛选)
                 # =========================================================
                 self._log(f" -> Running 1st RNNS Saliency Analysis (Selecting Top-{self.top_k} vars)...")
                 t_rnns_start = time.time()
@@ -247,13 +256,16 @@ class IRTGAttacker:
                 t_enrich_start = time.time()
                 tasks_to_generate = []
 
+                # =========================================================
+                # 专属深度 LLM 增强 (由于 target_vars 各模型不同，此时必须隔离)
+                # =========================================================
                 for var in target_vars:
                     task = batch_tasks_by_var.get(var)
                     if not task: continue
-                    cached_cands = sample_llm_cache.get(var, [])
-                    attempts = deep_enrich_attempts.get(var, 0)
+                    cached_cands = model_llm_cache.get(var, [])
+                    attempts = model_enrich_attempts.get(var, 0)
 
-                    # 只有当前 LLM 储备量不足 top_m 时才呼叫大模型
+                    # 只有当前模型储备不足，且未达尝试上限才调用大模型
                     if len(cached_cands) < self.llm_top_m and attempts < self.max_llm_enrich_attempts:
                         tasks_to_generate.append(task)
 
@@ -264,12 +276,15 @@ class IRTGAttacker:
                     missed_vars = [t['target_name'] for t in tasks_to_generate]
                     try:
                         new_llm_pool = self.llm_gen.generate_candidates(tasks_to_generate, target_quota=self.llm_top_m)
-                        for var in missed_vars: deep_enrich_attempts[var] = deep_enrich_attempts.get(var, 0) + 1
+
+                        # 仅更新当前模型的私有 Cache，杜绝泄露
+                        for var in missed_vars:
+                            model_enrich_attempts[var] = model_enrich_attempts.get(var, 0) + 1
                         for var, cands in new_llm_pool.items():
-                            old_cands = sample_llm_cache.get(var, [])
+                            old_cands = model_llm_cache.get(var, [])
                             merged = list(set(old_cands + list(cands or [])))
                             if len(merged) > len(old_cands): deep_enriched_this_round = True
-                            sample_llm_cache[var] = merged
+                            model_llm_cache[var] = merged
                     finally:
                         gc.collect()
                         if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -280,7 +295,8 @@ class IRTGAttacker:
                 self._log(
                     f"    [Time] Target Enrichment (Cache Check & Generation) took {time.time() - t_enrich_start:.2f}s")
 
-                final_subs_pool = self._merge_candidate_pools(mlm_full_pool, sample_llm_cache, self.total_quota)
+                # 生成针对该模型的最终池
+                final_subs_pool = self._merge_candidate_pools(mlm_full_pool, model_llm_cache, self.total_quota)
                 candidate_counts = {v: len(final_subs_pool.get(v, [])) for v in target_vars}
 
                 if self.rerank_after_llm_enrich and deep_enriched_this_round and target_vars:
@@ -321,6 +337,12 @@ class IRTGAttacker:
 
                 queries_consumed = self.model_zoo.get_query_count()
 
+                # 🌟 时间记录逻辑：计算本模型实际总耗时
+                # current_shared_time = 所有模型共享的前置操作耗时
+                # model_specific_elapsed = 本模型独占的（RNNS+Enrich+Optimize）耗时
+                model_specific_elapsed = time.time() - t_atk_model_start
+                total_model_attack_time = round(current_shared_time + model_specific_elapsed, 2)
+
                 sample_record = {
                     "sample_index": idx, "original_code": code,
                     "adversarial_code": adv_code if is_success else "",
@@ -328,7 +350,7 @@ class IRTGAttacker:
                     "original_prediction": orig_pred, "adversarial_prediction": adv_pred,
                     "is_success": is_success, "candidate_counts": json.dumps(candidate_counts, ensure_ascii=False),
                     "queries_consumed": queries_consumed,
-                    "attack_time_seconds": round(current_shared_time + (time.time() - t_atk_model_start), 2)
+                    "attack_time_seconds": total_model_attack_time  # 记录正确的总时间
                 }
                 storage_adv[atk_model].append(sample_record)
 
@@ -337,7 +359,7 @@ class IRTGAttacker:
                     stats[atk_model][atk_model]["success_queries"].append(queries_consumed)
                     self._log(f"    ✅ Success | {orig_pred} -> {adv_pred} | Queries: {queries_consumed}")
 
-                    # Cross-model transferability check
+                    # 🌟 泛化能力测算 (Transferability)
                     for vic_model in self.model_names:
                         if vic_model == atk_model: continue
                         if orig_predictions[vic_model]["pred"] == ground_truth:
@@ -348,12 +370,11 @@ class IRTGAttacker:
                 else:
                     self._log(f"    ❌ Failed | Queries: {queries_consumed}")
 
-                model_elapsed = time.time() - t_atk_model_start
-                model_time_stats[atk_model] += model_elapsed
+                model_time_stats[atk_model] += model_specific_elapsed
                 model_valid_counts[atk_model] += 1
                 sample_attacked_by_any = True
 
-                self._log(f"    [Time] Total processing time for model '{atk_model}': {model_elapsed:.2f}s")
+                self._log(f"    [Time] Total processing time for model '{atk_model}': {model_specific_elapsed:.2f}s")
 
             sample_elapsed = time.time() - t_sample_start
             if sample_attacked_by_any:
