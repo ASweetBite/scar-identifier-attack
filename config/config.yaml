@@ -4,15 +4,15 @@
 global:
   random_seed: 42
   max_workers: 8
-  result_dir: "./results"
+  result_dir: "./results/diverse"
   lang: "cpp"                 # 从 analyzer 移动到这里，统一全局语言
 
 # ==========================================
 # 2. Runtime & Dataset Parameters
 # ==========================================
 run_params:
-  samples: 200
-  dataset: "./data/alert/test.parquet"
+  samples: 300
+  dataset: "./data/diverse/test.parquet"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   num_classes: 2
   use_majority_voting: false

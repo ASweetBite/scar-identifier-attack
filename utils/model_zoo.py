@@ -95,7 +95,8 @@ import torch
 import numpy as np
 from typing import Tuple, List
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from peft import PeftModel
+from peft import PeftModel, PeftConfig
+
 
 class ModelZoo:
     def __init__(self, model_configs: dict, eval_mode: str, config: dict):
@@ -132,42 +133,53 @@ class ModelZoo:
                     f"[!] CRITICAL: Target path {path} not found for model '{name}'. Aborting init.")
 
             try:
-                tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+                # [*] Loading Tokenizer (Fast Mode Enabled)...
+                tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=True)
                 adapter_config_path = os.path.join(path, "adapter_config.json")
 
                 if os.path.exists(adapter_config_path):
                     # =========================================================
-                    # [分支 A]: 加载你训练的 LoRA 模型 (带独立分类头)
+                    # 🌟 完全照搬 test_graph.py 的成功逻辑
                     # =========================================================
-                    print(f"    |- Detected LoRA adapter. Parsing base model config...")
+                    print(f"    |- Detected LoRA adapter. Parsing config...")
                     with open(adapter_config_path, 'r', encoding='utf-8') as f:
                         peft_config = json.load(f)
 
+                    # 提取 base_model 的名称
                     base_model_name = peft_config.get("base_model_name_or_path")
-                    if not base_model_name:
-                        raise ValueError(f"Missing 'base_model_name_or_path' in {adapter_config_path}")
 
-                    print(f"    |- Loading base model skeleton from: {base_model_name}")
+                    # 容错机制：如果 adapter_config.json 里存的是之前电脑上的绝对死路径
+                    # 就根据当前模型的名字，强制推断回 HuggingFace 的线上基座名称
+                    if not base_model_name or (not os.path.exists(base_model_name) and (
+                            "/" in base_model_name or "\\" in base_model_name) and "microsoft" not in base_model_name):
+                        name_lower = name.lower()
+                        if "graphcodebert" in name_lower:
+                            base_model_name = "microsoft/graphcodebert-base"
+                        elif "unixcoder" in name_lower:
+                            base_model_name = "microsoft/unixcoder-base"
+                        else:
+                            base_model_name = "microsoft/codebert-base"
+                        print(f"    |- [*] Auto-fallback to HF Hub: {base_model_name}")
+
+                    # [*] Loading Standard HF Classifier Skeleton...
+                    print(f"    |- Loading Standard HF Classifier Skeleton from: {base_model_name}")
                     base_model = AutoModelForSequenceClassification.from_pretrained(
                         base_model_name,
                         num_labels=self.num_classes,
                         trust_remote_code=True,
-                        ignore_mismatched_sizes=True  # 🌟 必须开启：允许分类头尺寸自适应重塑
+                        ignore_mismatched_sizes=True
                     )
 
-                    print(f"    |- Mounting LoRA weights and Custom Classifier...")
-                    # 🌟 必须直接保留 PeftModel 包装器，绝不调用 merge_and_unload()
-                    # 这样才能保住你用 modules_to_save=["classifier"] 辛苦训练出来的全连接层
+                    # [*] Loading LoRA Adapters and Classifier...
+                    print(f"    |- Loading LoRA Adapters and Classifier from {path}...")
                     model = PeftModel.from_pretrained(base_model, path)
-                    print("    |- ✅ LoRA and Classifier successfully mounted.")
+                    print("    |- ✅ LoRA weights and Custom Classifier successfully injected.")
 
                 else:
                     # =========================================================
-                    # [分支 B]: 加载标准的全量 HuggingFace 模型 (不带 LoRA)
+                    # 兼容非 LoRA 模型的普通加载逻辑
                     # =========================================================
                     print(f"    |- Loading standard HF classifier...")
-                    # 彻底删除了手动拦截 weights、去前缀、1D转2D 的历史遗留逻辑
-                    # 直接信任 HuggingFace 的原生加载能力
                     model = AutoModelForSequenceClassification.from_pretrained(
                         path,
                         num_labels=self.num_classes,
@@ -176,18 +188,21 @@ class ModelZoo:
                     )
                     print("    |- ✅ Standard model loaded successfully.")
 
-                # 将模型推至设备并开启评估模式
                 model.to(self.device)
                 model.eval()
                 self.models[name] = {"type": "transformer", "tokenizer": tokenizer, "model": model}
                 print(f"[+] Successfully loaded {name} to {self.device}")
 
             except Exception as e:
-                raise RuntimeError(f"Failed to load model '{name}' from path '{path}'. Execution halted.") from e
+                import traceback
+                print("\n" + "=" * 50)
+                print(f"🚨 FAILED TO LOAD MODEL: {name}")
+                print(f"Path: {path}")
+                print("Error Traceback:")
+                traceback.print_exc()
+                print("=" * 50 + "\n")
+                raise RuntimeError(f"Failed to load model '{name}'. Execution halted.") from e
 
-    # =========================================================================
-    # 特征编码分发区 (Feature Encoding Dispatchers)
-    # =========================================================================
 
     def _encode_graphcodebert(self, code: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         code_bytes = code.encode('utf-8')
