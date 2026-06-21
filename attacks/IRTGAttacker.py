@@ -88,6 +88,7 @@ class IRTGAttacker:
         return final_pool
 
     def attack(self, dataset: List[Dict]):
+        import random  # 确保使用了 random 库进行候选池打乱
         self.attack_logs = []
 
         stats = {atk: {vic: {"total": 0, "fooled": 0, "success_queries": []} for vic in self.model_names} for atk in
@@ -164,9 +165,10 @@ class IRTGAttacker:
             self._log(f"    [Time] AST Folding & Setup took {time.time() - t_ast_start:.2f}s")
 
             # =========================================================
-            # [阶段 1] 全局 MLM 快速生成 (依据 lightweight 配置)
+            # [阶段 1] 全局 MLM 快速生成
             # =========================================================
-            self._log(f" -> Running FULL MLM Generation (Gen: {self.top_k_mlm}, Keep: {self.mlm_top_n_keep}), Nums: {len(batch_tasks)}...")
+            self._log(
+                f" -> Running FULL MLM Generation (Gen: {self.top_k_mlm}, Keep: {self.mlm_top_n_keep}), Nums: {len(batch_tasks)}...")
             t_mlm_start = time.time()
             mlm_full_pool = {}
 
@@ -192,22 +194,9 @@ class IRTGAttacker:
             deep_enrich_attempts = {v: 0 for v in variables}
 
             # =========================================================
-            # [阶段 2] LLM 探针浅层试探 (依据 irtg.llm_probe_quota)
+            # [阶段 2] (已被优化器彻底省略，直接使用 MLM 初筛)
             # =========================================================
-            self._log(f" -> Running LLM Shallow Probe (Quota: {self.llm_probe_quota} cands/var)...")
-            t_probe_start = time.time()
-            try:
-                llm_probe_pool = self.llm_gen.generate_candidates(batch_tasks, target_quota=self.llm_probe_quota)
-                for var, cands in llm_probe_pool.items():
-                    if var in sample_llm_cache:
-                        sample_llm_cache[var] = list(set(cands))
-            finally:
-                gc.collect()
-                if torch.cuda.is_available(): torch.cuda.empty_cache()
-            self._log(f"    [Time] LLM Probe Generation took {time.time() - t_probe_start:.2f}s")
-
-            # 构建初期混合评估池
-            rnns_eval_pool = self._merge_candidate_pools(mlm_full_pool, sample_llm_cache, final_quota=self.total_quota)
+            psr_eval_pool = mlm_full_pool
             current_shared_time = time.time() - t_shared_start
             sample_attacked_by_any = False
 
@@ -223,6 +212,9 @@ class IRTGAttacker:
                 stats[atk_model][atk_model]["total"] += 1
                 self.model_zoo.reset_counter()
 
+                # 🚀 [优化 1]：为当前样本初始化一个隔离的探针记忆缓存，避免重排时重复查询
+                sample_rnns_cache = {}
+
                 # =========================================================
                 # [阶段 3] 第一次 RNNS (筛选目标变量) 依据 irtg.top_k
                 # =========================================================
@@ -231,8 +223,9 @@ class IRTGAttacker:
                 actual_top_k = min(self.top_k, len(variables))
 
                 rnns_output = rankers[atk_model].rank_variables(
-                    code=code, variables=variables.copy(), subs_pool=rnns_eval_pool,
-                    reference_label=orig_pred, top_k=actual_top_k
+                    code=code, variables=variables.copy(), subs_pool=psr_eval_pool,
+                    reference_label=orig_pred, top_k=actual_top_k,
+                    history_cache=sample_rnns_cache  # 🚀 [传入 Cache]
                 )
 
                 if len(rnns_output) == 3:
@@ -258,6 +251,8 @@ class IRTGAttacker:
                         tasks_to_generate.append(task)
 
                 deep_enriched_this_round = False
+                actually_enriched_vars = []  # 🚀 [优化 2]：精确追踪哪些变量真正扩充了词汇
+
                 if tasks_to_generate:
                     self._log(
                         f" -> LLM Deep Enrichment for {len(tasks_to_generate)} vars (Target: {self.llm_top_m})...")
@@ -268,7 +263,9 @@ class IRTGAttacker:
                         for var, cands in new_llm_pool.items():
                             old_cands = sample_llm_cache.get(var, [])
                             merged = list(set(old_cands + list(cands or [])))
-                            if len(merged) > len(old_cands): deep_enriched_this_round = True
+                            if len(merged) > len(old_cands):
+                                deep_enriched_this_round = True
+                                actually_enriched_vars.append(var)  # 🚀 记录真正发生变化的变量
                             sample_llm_cache[var] = merged
                     finally:
                         gc.collect()
@@ -283,29 +280,52 @@ class IRTGAttacker:
                 final_subs_pool = self._merge_candidate_pools(mlm_full_pool, sample_llm_cache, self.total_quota)
                 candidate_counts = {v: len(final_subs_pool.get(v, [])) for v in target_vars}
 
-                if self.rerank_after_llm_enrich and deep_enriched_this_round and target_vars:
-                    self._log(" -> Re-running lightweight RNNS after LLM enrichment...")
+                # 🚀 [优化 3]：增量重排序 (Delta Re-ranking) 仅针对补充了新词的变量
+                if self.rerank_after_llm_enrich and deep_enriched_this_round and actually_enriched_vars:
+                    self._log(f" -> Re-running lightweight RNNS for {len(actually_enriched_vars)} enriched vars...")
                     t_rerank_start = time.time()
 
+                    # 仅探查候选池发生变化的变量，且复用之前的 cache 过滤重复项
                     rerank_output = rankers[atk_model].rank_variables(
-                        code=code, variables=target_vars.copy(), subs_pool=final_subs_pool,
-                        reference_label=orig_pred, top_k=len(target_vars)
+                        code=code, variables=actually_enriched_vars.copy(), subs_pool=final_subs_pool,
+                        reference_label=orig_pred, top_k=len(actually_enriched_vars),
+                        history_cache=sample_rnns_cache  # 🚀 [传入 Cache，享受 O(0) 的短路极速]
                     )
-                    if len(rerank_output) == 3:
-                        target_vars, rerank_scores, rnns_best_seed = rerank_output
-                    else:
-                        target_vars, rerank_scores = rerank_output
 
-                    target_scores = {var: rerank_scores.get(var, all_scores.get(var, 0.0)) for var in target_vars}
-                    self._log(f"    [Time] RNNS Re-rank took {time.time() - t_rerank_start:.2f}s")
+                    if len(rerank_output) == 3:
+                        _, rerank_scores, rnns_best_seed = rerank_output
+                    else:
+                        _, rerank_scores = rerank_output
+
+                    # 增量合并得分
+                    for v in rerank_scores:
+                        all_scores[v] = rerank_scores[v]
+                        target_scores[v] = rerank_scores[v]
+
+                    # 根据最新的综合得分，重新对 target_vars 进行降序排列
+                    target_vars = sorted(target_vars, key=lambda x: target_scores.get(x, -100.0), reverse=True)
+
+                    self._log(f"    [Time] RNNS Delta Re-rank took {time.time() - t_rerank_start:.2f}s")
+
+                # =========================================================
+                # 🚀 [优化 4] 打乱最终候选池，确保优化器公平对待 LLM 和 MLM 词汇
+                # =========================================================
+                # shuffled_subs_pool = {}
+                # for v, cands in final_subs_pool.items():
+                #     cands_copy = list(cands)
+                #     random.shuffle(cands_copy)
+                #     shuffled_subs_pool[v] = cands_copy
 
                 self._log(" -> Attack execution started...")
                 t_opt_start = time.time()
+
                 run_kwargs = {
                     "code": code, "original_pred": orig_pred,
-                    "target_vars": target_vars, "subs_pool": final_subs_pool,
+                    "target_vars": target_vars,
+                    "subs_pool": final_subs_pool,  # 🚀 传入打乱后的公平 Pool
                     "variable_scores": target_scores
                 }
+
                 if self.optimizer_type == "ga":
                     if rnns_best_seed: run_kwargs["rnns_best_seed"] = rnns_best_seed
                     run_kwargs["all_vars"] = ranked_vars

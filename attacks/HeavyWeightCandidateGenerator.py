@@ -55,14 +55,15 @@ class HeavyWeightCandidateGenerator:
             if not parts or (len(parts) == 1 and parts[0] == name): return [name], ''
             return parts, 'camel'
 
-    def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int) -> tuple[str, str]:
-        # Extracts local prefix and suffix string context for an AST range.
-        from tree_sitter import Parser
-        parser = Parser()
-        parser.language = self.analyzer.language
-        tree = parser.parse(code_bytes)
-
+    def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int, tree) -> tuple[
+        str, str]:
+        # Extracts neighboring syntax fragments surrounding the target variable from AST.
+        # from tree_sitter import Parser
+        # parser = Parser()
+        # parser.language = self.analyzer.language
+        # tree = parser.parse(code_bytes)
         node = tree.root_node.descendant_for_byte_range(target_start, target_end)
+
         if not node:
             line_start = code_bytes.rfind(b'\n', 0, target_start) + 1
             line_end = code_bytes.find(b'\n', target_end)
@@ -81,24 +82,21 @@ class HeavyWeightCandidateGenerator:
         stmt_end = statement_node.end_byte
         local_prefix = code_bytes[stmt_start:target_start].decode("utf-8", errors="replace")
         local_suffix = code_bytes[target_end:stmt_end].decode("utf-8", errors="replace")
-
         return local_prefix, local_suffix
 
-    def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict]) -> int:
-        # Computes a score to select the best occurrence of a variable based on syntax complexity.
+    def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict], tree) -> int:
         if len(occurrences) <= 1: return 0
         best_idx, max_score = 0, -1.0
         search_limit = min(len(occurrences), 10)
 
         for i in range(search_limit):
             occ = occurrences[i]
-            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'])
+            # 传入 tree
+            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'], tree)
             score = len(local_prefix) + len(local_suffix)
-
             if '(' in local_suffix or ',' in local_suffix: score += 100
             if any(k in local_prefix for k in ['if ', 'while ', 'for ', 'return ']): score += 80
             if re.search(r'=\s*(0|NULL|nullptr|false|true|\{\})\s*;', local_suffix): score -= 150
-
             if score > max_score:
                 max_score = score
                 best_idx = i
@@ -121,7 +119,7 @@ class HeavyWeightCandidateGenerator:
             batch_prefixes = prefixes[i: i + batch_size]
             batch_vars = var_names[i: i + batch_size]
 
-            inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(
+            inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=96).to(
                 device)
 
             with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype):
@@ -138,8 +136,8 @@ class HeavyWeightCandidateGenerator:
                 pv_tokens = tokenizer.encode(p_text + batch_vars[b_idx], add_special_tokens=False)
 
                 shared_len = sum(1 for pt, pvt in zip(p_tokens, pv_tokens) if pt == pvt)
-                start_idx = min(shared_len + 1, 255)
-                end_idx = min(max(start_idx + 1, len(pv_tokens) + 1), 256)
+                start_idx = min(shared_len + 1, 95)
+                end_idx = min(max(start_idx + 1, len(pv_tokens) + 1), 96)
 
                 pooled = last_hidden[b_idx, start_idx:end_idx, :].mean(dim=0)
                 all_embeddings.append(pooled.to(torch.float32).cpu())
@@ -316,18 +314,20 @@ JSON
 
         llm_prompts = []
         task_metadata = {}
-
+        from tree_sitter import Parser
+        parser = Parser()
+        parser.language = self.analyzer.language
         for task_idx, task in enumerate(vulnerable_tasks):
             target_name = task["target_name"]
 
             slice_code_str = task["code_str"]
             slice_code_bytes = slice_code_str.encode("utf-8")
-
+            tree = parser.parse(slice_code_bytes)
             slice_identifiers = self.analyzer.extract_identifiers(slice_code_bytes)
             if target_name not in slice_identifiers:
                 continue
 
-            best_occ_idx = self._find_best_context_occurrence(slice_code_bytes, slice_identifiers[target_name])
+            best_occ_idx = self._find_best_context_occurrence(slice_code_bytes, slice_identifiers[target_name], tree)
             target_info = slice_identifiers[target_name][best_occ_idx]
 
             raw_entity_type = target_info.get('entity_type', 'variable')
@@ -357,7 +357,7 @@ JSON
                 "local_prefix": prefix_str, "local_suffix": suffix_str
             }
 
-            prompt = self._build_llm_prompt(slice_code_str, target_name, original_style, target_quota * 2, entity_type,
+            prompt = self._build_llm_prompt(slice_code_str, target_name, original_style, int(target_quota * 1.5), entity_type,
                                             len(parts))
             llm_prompts.append(prompt)
 

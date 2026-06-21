@@ -175,12 +175,12 @@ class LightweightCandidateGenerator:
         else:
             return mask_token
 
-    def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int) -> tuple[str, str]:
+    def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int, tree) -> tuple[str, str]:
         # Extracts neighboring syntax fragments surrounding the target variable from AST.
-        from tree_sitter import Parser
-        parser = Parser()
-        parser.language = self.analyzer.language
-        tree = parser.parse(code_bytes)
+        # from tree_sitter import Parser
+        # parser = Parser()
+        # parser.language = self.analyzer.language
+        # tree = parser.parse(code_bytes)
         node = tree.root_node.descendant_for_byte_range(target_start, target_end)
 
         if not node:
@@ -203,15 +203,15 @@ class LightweightCandidateGenerator:
         local_suffix = code_bytes[target_end:stmt_end].decode("utf-8", errors="replace")
         return local_prefix, local_suffix
 
-    def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict]) -> int:
-        # Selects the context occurrence that provides the richest syntactic environment.
+    def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict], tree) -> int:
         if len(occurrences) <= 1: return 0
         best_idx, max_score = 0, -1.0
         search_limit = min(len(occurrences), 10)
 
         for i in range(search_limit):
             occ = occurrences[i]
-            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'])
+            # 传入 tree
+            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'], tree)
             score = len(local_prefix) + len(local_suffix)
             if '(' in local_suffix or ',' in local_suffix: score += 100
             if any(k in local_prefix for k in ['if ', 'while ', 'for ', 'return ']): score += 80
@@ -268,7 +268,7 @@ class LightweightCandidateGenerator:
             batch_prefixes = prefixes[i: i + batch_size]
             batch_vars = var_names[i: i + batch_size]
 
-            inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(
+            inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=96).to(
                 device)
 
             with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype):
@@ -285,8 +285,8 @@ class LightweightCandidateGenerator:
                 pv_tokens = tokenizer.encode(p_text + batch_vars[b_idx], add_special_tokens=False)
 
                 shared_len = sum(1 for pt, pvt in zip(p_tokens, pv_tokens) if pt == pvt)
-                start_idx = min(shared_len + 1, 255)
-                end_idx = min(max(start_idx + 1, len(pv_tokens) + 1), 256)
+                start_idx = min(shared_len + 1, 95)
+                end_idx = min(max(start_idx + 1, len(pv_tokens) + 1), 96)
 
                 pooled = last_hidden[b_idx, start_idx:end_idx, :].mean(dim=0)
                 all_embeddings.append(pooled.to(torch.float32).cpu())
@@ -391,21 +391,23 @@ class LightweightCandidateGenerator:
         mlm_tracking = []
         task_metadata = {}
         mask_token = self.mlm_engine.tokenizer.mask_token
-
+        from tree_sitter import Parser
+        parser = Parser()
+        parser.language = self.analyzer.language
         for task_idx, task in enumerate(batch_tasks):
             target_name = task["target_name"]
 
             slice_code_str = task["code_str"]
             slice_code_bytes = slice_code_str.encode("utf-8")
+            tree = parser.parse(slice_code_bytes)
 
             slice_identifiers = self.analyzer.extract_identifiers(slice_code_bytes)
 
             if target_name not in slice_identifiers:
                 continue
 
-            best_occ_idx = self._find_best_context_occurrence(slice_code_bytes, slice_identifiers[target_name])
+            best_occ_idx = self._find_best_context_occurrence(slice_code_bytes, slice_identifiers[target_name], tree)
             target_info = slice_identifiers[target_name][best_occ_idx]
-
             leading_m = re.match(r'^_+', target_name)
             leading_us = leading_m.group(0) if leading_m else ""
             core_name = target_name[len(leading_us):] if leading_us else target_name

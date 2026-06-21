@@ -24,8 +24,8 @@ models:
   mlm_engine: "microsoft/codebert-base-mlm"
   llm_generator: "models/qwen2.5-1.5b-code"
   target_models:
-#   CodeBERT: "./models/ALERT_CodeBERT"
-    GraphCodeBERT: "./models/ALERT_GraphCodeBERT"
+    CodeBERT: "./models/ALERT_CodeBERT"
+#    GraphCodeBERT: "./models/ALERT_GraphCodeBERT"
 #    UniXcoder: "./models/UniXcoder_best_f1"
 
 # ==========================================
@@ -43,14 +43,14 @@ candidate_generation:
 
   # --- 轻量级 (MLM) 专属配置 ---
   lightweight:
-    top_k_mlm: 60
+    top_k_mlm: 50
     top_n_keep: 50
     semantic_threshold: 0.90
 
   # --- 重量级 (LLM) 专属配置 ---
   heavyweight:
-    top_m: 25
-    semantic_threshold: 0.90
+    top_m: 10
+    semantic_threshold: 0.85
     structural_semantic_threshold: 0.5
     context_ratio: 0.1
 
@@ -62,10 +62,10 @@ attack:
   iterations: 25        # 移动自 run_params
 
   irtg:
-    top_k: 10
+    top_k: 5
     total_quota: 50
     llm_probe_quota: 4
-    max_llm_enrich_attempts: 2
+    max_llm_enrich_attempts: 1
     rerank_after_llm_enrich: true
 
   beam_search:

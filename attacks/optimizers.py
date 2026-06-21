@@ -339,6 +339,9 @@ class GreedyOptimizer:
 import math
 from typing import List, Dict, Tuple, Any
 
+import math
+from typing import List, Dict, Tuple
+
 
 class BeamSearchOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
@@ -352,26 +355,8 @@ class BeamSearchOptimizer:
         self.run_mode = run_cfg.get('run_mode', 'attack')
 
         self.beam_size = beam_cfg.get('beam_size', 3)
-        self.cand_chunk_size = beam_cfg.get('cand_chunk_size', 10)
 
-        # ==========================================================
-        # Beam 早停策略：可配置
-        #   none/disabled/off/false : 不早停，遍历当前变量全部候选
-        #   dynamic                 : 保留原逻辑：候选 chunk 有显著提升且变量数充足才早停
-        #   gain                    : 只要候选 chunk 有显著提升就早停
-        #   patience                : 连续若干 chunk 没有显著提升才早停
-        # ==========================================================
-        self.early_stop_delta = beam_cfg.get('early_stop_delta', 0.3)
-        self.early_stop_strategy = str(
-            beam_cfg.get('beam_early_stop_strategy', beam_cfg.get('early_stop_strategy', 'dynamic'))
-        ).lower()
-        self.early_stop_patience = int(beam_cfg.get('beam_early_stop_patience', 2))
-        self.early_stop_min_valid_vars = int(beam_cfg.get('beam_early_stop_min_valid_vars', 3))
-
-        # ==========================================================
-        # AST 合法性校验：默认开启。
-        # 需要在 run(...) 中传入 analyzer；如果没有传入 analyzer，自动降级为只依赖 rename_fn。
-        # ==========================================================
+        # 移除已弃用的早停参数，代码更加清爽
         self.enable_ast_check = bool(beam_cfg.get('beam_enable_ast_check', True))
         self._warned_missing_analyzer = False
 
@@ -390,31 +375,11 @@ class BeamSearchOptimizer:
             target_prob = max(probs[target_idx], 1e-9)
             return math.log(target_prob) - math.log(orig_prob)
 
-        # 多分类 Margin Loss：防止概率扩散。
+        # 多分类 Margin Loss
         other_probs = [p for i, p in enumerate(probs) if i != orig_idx]
         max_other_prob = max(other_probs) if other_probs else 1e-9
         max_other_prob = max(max_other_prob, 1e-9)
         return math.log(max_other_prob) - math.log(orig_prob)
-
-    def _should_stop_after_chunk(self, chunk_best_fitness_gain: float, valid_var_count: int,
-                                 bad_chunk_count: int) -> bool:
-        strategy = self.early_stop_strategy
-
-        if strategy in {"none", "disabled", "disable", "off", "false", "0"}:
-            return False
-
-        if strategy == "gain":
-            return chunk_best_fitness_gain >= self.early_stop_delta
-
-        if strategy == "patience":
-            if valid_var_count < self.early_stop_min_valid_vars:
-                return False
-            return bad_chunk_count >= self.early_stop_patience
-
-        # 默认 dynamic：兼容你原来的“有明显提升就停，但变量数太少时不停”。
-        if valid_var_count >= self.early_stop_min_valid_vars:
-            return chunk_best_fitness_gain >= self.early_stop_delta
-        return False
 
     def run(self, code: str, original_pred: int, target_vars: List[str], subs_pool: Dict[str, List[str]],
             variable_scores: Dict[str, float] = None):
@@ -442,7 +407,7 @@ class BeamSearchOptimizer:
             preds_list = [res[1] for res in cached_results]
             return probs_list, preds_list
 
-        # 基线预测。
+        # 基线预测
         init_probs, init_preds = _get_predictions([code])
         orig_probs = init_probs[0]
         orig_pred = init_preds[0]
@@ -453,85 +418,72 @@ class BeamSearchOptimizer:
         overall_best_fitness = initial_fitness
         overall_best_code = code
 
-        valid_var_count = len([v for v in sorted_vars if subs_pool.get(v, [])])
-
         for var in sorted_vars:
             candidates = subs_pool.get(var, [])
             if not candidates:
                 continue
 
             new_beam_candidates = []
+            mutation_tasks = []
 
+            # 1. 扁平化生成任务：将当前 Beam 里的所有状态和所有候选词一次性铺平
             for curr_fitness, curr_code, curr_probs, curr_pred in beam:
+                # 保留当前不替换的状态
                 new_beam_candidates.append((curr_fitness, curr_code, curr_probs, curr_pred))
-                bad_chunk_count = 0
 
-                for i in range(0, len(candidates), self.cand_chunk_size):
-                    cand_chunk = candidates[i:i + self.cand_chunk_size]
-
-                    codes_to_predict = []
-                    for cand in cand_chunk:
-                        if cand == var:
-                            continue
-
-                        try:
-                            temp_code = self.rename_fn(curr_code, {var: cand})
-                            if temp_code:
-                                codes_to_predict.append(temp_code)
-                        except Exception:
-                            continue
-
-                    if not codes_to_predict:
-                        if self.early_stop_strategy == "patience":
-                            bad_chunk_count += 1
-                            if self._should_stop_after_chunk(0.0, valid_var_count, bad_chunk_count):
-                                break
+                for cand in candidates:
+                    if cand == var:
+                        continue
+                    try:
+                        temp_code = self.rename_fn(curr_code, {var: cand})
+                        if temp_code and temp_code != curr_code:
+                            mutation_tasks.append((curr_fitness, temp_code))
+                    except Exception:
                         continue
 
-                    batch_probs, batch_preds = _get_predictions(codes_to_predict)
-                    chunk_best_fitness_gain = 0.0
+            if not mutation_tasks:
+                continue
 
-                    for probs, pred, temp_code in zip(batch_probs, batch_preds, codes_to_predict):
-                        fitness = self._calculate_fitness(probs, original_pred)
-                        fitness_gain = fitness - curr_fitness
+            # 2. 宏批次推理 (Macro-Batching)：打破原来由于 early_stop 造成的微小 chunk 限制
+            codes_to_predict = [task[1] for task in mutation_tasks]
+            all_probs, all_preds = [], []
 
-                        if fitness_gain > chunk_best_fitness_gain:
-                            chunk_best_fitness_gain = fitness_gain
+            # 设定最优显卡吞吐 Batch Size (如 32 或 64)
+            OPTIMAL_BATCH_SIZE = 32
+            for i in range(0, len(codes_to_predict), OPTIMAL_BATCH_SIZE):
+                batch_codes = codes_to_predict[i:i + OPTIMAL_BATCH_SIZE]
+                b_probs, b_preds = _get_predictions(batch_codes)
+                all_probs.extend(b_probs)
+                all_preds.extend(b_preds)
 
-                        if fitness > overall_best_fitness:
-                            overall_best_fitness = fitness
-                            overall_best_code = temp_code
+            # 3. 结果核算与提前退出
+            for (parent_fitness, temp_code), probs, pred in zip(mutation_tasks, all_probs, all_preds):
+                fitness = self._calculate_fitness(probs, original_pred)
 
-                        if pred != original_pred and self.run_mode == "attack":
-                            verify_probs, verify_preds = _get_predictions([temp_code])
-                            if verify_preds[0] != original_pred:
-                                return True, temp_code, verify_probs[0], verify_preds[0]
+                if fitness > overall_best_fitness:
+                    overall_best_fitness = fitness
+                    overall_best_code = temp_code
 
-                        new_beam_candidates.append((fitness, temp_code, probs, pred))
+                # 🚀 [优化 2] 移除双重校验 bug，只要预测标签改变，立即宣告攻击成功
+                if pred != original_pred and self.run_mode == "attack":
+                    return True, temp_code, probs, pred
 
-                    if self.early_stop_strategy == "patience":
-                        if chunk_best_fitness_gain < self.early_stop_delta:
-                            bad_chunk_count += 1
-                        else:
-                            bad_chunk_count = 0
+                new_beam_candidates.append((fitness, temp_code, probs, pred))
 
-                    if self._should_stop_after_chunk(chunk_best_fitness_gain, valid_var_count, bad_chunk_count):
-                        break
-
+            # 4. 束搜索剪枝 (Beam Pruning) & 依据代码去重
             unique_candidates = {}
             for state in new_beam_candidates:
-                if state[1] not in unique_candidates or state[0] > unique_candidates[state[1]][0]:
-                    unique_candidates[state[1]] = state
+                code_str = state[1]
+                if code_str not in unique_candidates or state[0] > unique_candidates[code_str][0]:
+                    unique_candidates[code_str] = state
 
             sorted_candidates = sorted(unique_candidates.values(), key=lambda x: x[0], reverse=True)
             beam = sorted_candidates[:self.beam_size]
 
         final_probs_list, final_preds_list = _get_predictions([overall_best_code])
-        final_probs = final_probs_list[0]
-        final_pred = final_preds_list[0]
 
-        is_success = final_pred != original_pred
-        return is_success, overall_best_code, final_probs, final_pred
+        is_success = final_preds_list[0] != original_pred
+        return is_success, overall_best_code, final_probs_list[0], final_preds_list[0]
 
 
 
