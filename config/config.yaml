@@ -4,17 +4,17 @@
 global:
   random_seed: 42
   max_workers: 8
-  result_dir: "./results/diverse"
-  lang: "cpp"                 # 从 analyzer 移动到这里，统一全局语言
+  result_dir: "./results"
+  lang: "python"                 # 从 analyzer 移动到这里，统一全局语言
 
 # ==========================================
 # 2. Runtime & Dataset Parameters
 # ==========================================
 run_params:
-  samples: 300
-  dataset: "./data/diverse/test.parquet"
-  label_map: "./models/finetuned_model_codebert_1/label_map.json"
-  num_classes: 2
+  samples: 200
+  dataset: "./data/dataset/train_fixed.jsonl"
+  label_map: "./data/dataset/classes.txt"
+  num_classes: 66
   use_majority_voting: false
 
 # ==========================================
@@ -24,9 +24,9 @@ models:
   mlm_engine: "microsoft/codebert-base-mlm"
   llm_generator: "models/qwen2.5-1.5b-code"
   target_models:
-    CodeBERT: "./models/CodeBERT_best_f1"
-    GraphCodeBERT: "./models/GraphCodeBERT_best_f1"
-    UniXcoder: "./models/UniXcoder_best_f1"
+    CodeBERT: "./models/ALERT-CODEBERT"
+#    GraphCodeBERT: "./models/GraphCodeBERT_best_f1"
+#    UniXcoder: "./models/UniXcoder_best_f1"
 
 # ==========================================
 # 4. Candidate Generation (MLM & LLM)
