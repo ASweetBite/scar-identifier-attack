@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import random
 import numpy as np
@@ -9,7 +8,6 @@ import yaml
 from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from attacks.IRTGAttacker import IRTGAttacker
 from attacks.LightWeightCandidateGenerator import LightweightCandidateGenerator
-from attacks.PPLStatisticsCollector import PPLStatisticsCollector
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset import DatasetLoader
 from utils.llm_loader import LocalLLMClient
@@ -22,7 +20,7 @@ def main(args, config):
     """Orchestrates the evaluation of model robustness against various renaming attacks."""
 
     # 读取全局语言
-    lang = config['global'].get('lang', 'cpp')
+    lang = config['global'].get('lang', 'python')
     analyzer = IdentifierAnalyzer(lang=lang)
 
     # 路径映射调整
@@ -119,13 +117,11 @@ def main(args, config):
 
     loader = DatasetLoader()
     print(f"\n[*] Loading dataset in {args.mode} mode...")
-    run_params = config['run_params']
-    dataset = loader.load_parquet_dataset(
+    dataset = loader.load_jsonl_dataset(
         filepath=run_params['dataset'],
-        mode=args.mode,
-        max_samples=run_params['samples'],
-        label_map_path=run_params.get('label_map'),
-        random_seed=config['global'].get('random_seed', 42)
+        max_samples=run_params.get('samples'),
+        random_seed=config['global'].get('random_seed', 50),
+        classes_txt_path=run_params.get('label_map')
     )
 
     # collector = PPLStatisticsCollector(...)

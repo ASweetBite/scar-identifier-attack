@@ -1,16 +1,23 @@
 import logging
 import random
-from typing import List, Dict
+from typing import List, Dict, Tuple
+import os
+import json
+import torch
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from peft import PeftModel, PeftConfig
 
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 
 logger = logging.getLogger(__name__)
 
+
 class ModelZooQueryTracker:
     """
-    黑盒查询拦截器：利用代理模式透明地包装 ModelZoo。
-    严格记录针对特定大模型的所有预测查询开销（包含单步预测和批处理预测）。
+    黑盒查询拦截器：记录所有预测查询开销。
     """
+
     def __init__(self, model_zoo):
         self._model_zoo = model_zoo
         self._query_count = 0
@@ -34,8 +41,8 @@ class ModelZooQueryTracker:
         return self._model_zoo.predict_label_conf(*args, **kwargs)
 
     def __getattr__(self, name):
-        # 将其他所有未重写的方法/属性（如 model_names）透明转发给底层的 model_zoo
         return getattr(self._model_zoo, name)
+
 
 class CodeSmoother:
     def __init__(self, config: Dict, candidate_generator):
@@ -45,7 +52,8 @@ class CodeSmoother:
         self.replace_prob = config.get("replace_prob", 0.5)
         self.batch_size = config.get("batch_size", 32)
         self.candidate_generator = candidate_generator
-        self.analyzer = IdentifierAnalyzer()
+        # ✨ 修改点：使用 python 的解析器
+        self.analyzer = IdentifierAnalyzer(lang="python")
 
     def generate_smoothed_samples(self, code: str, candidate_dict: dict = None, sensitive_vars: list = None) -> List[
         str]:
@@ -89,41 +97,27 @@ class CodeSmoother:
         return samples
 
 
-import os
-import json
-import torch
-import numpy as np
-from typing import Tuple, List
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from peft import PeftModel, PeftConfig
-
-
 class ModelZoo:
     def __init__(self, model_configs: dict, eval_mode: str, config: dict):
         glob_cfg = config.get('global', {})
         run_cfg = config.get('run_params', {})
 
         self.device = torch.device(glob_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
-        self.eval_mode = eval_mode
+        # eval_mode 参数这里可以保留占位，但在作者溯源中我们固定走多分类
         self.max_seq_len = run_cfg.get('max_seq_len', 512)
 
-        if self.eval_mode == "binary":
-            self.num_classes = 2
-            print("[*] ModelZoo running in BINARY mode (Forcing num_classes = 2)")
-        else:
-            self.num_classes = run_cfg.get('num_classes', 16)
-            print(f"[*] ModelZoo running in MULTI mode (num_classes = {self.num_classes})")
+        # ✨ 修改点：作者溯源是固定的 66 分类（或其他由外部传入的类别数）
+        self.num_classes = run_cfg.get('num_classes', 66)
+        print(f"[*] ModelZoo running in Authorship Attribution Mode (num_classes = {self.num_classes})")
 
         self.models = {}
         self.model_names = list(model_configs.keys())
 
-        # =====================================================================
-        # 1. 动态加载 DFG 特征提取器
-        # =====================================================================
+        # 动态加载 DFG 特征提取器（适配 Python）
         self.analyzer = None
         if any("graphcodebert" in name.lower() for name in self.model_names):
-            print("[*] Detected GraphCodeBERT in targets. Initializing DFG Extractor...")
-            self.analyzer = IdentifierAnalyzer(lang="cpp")
+            print("[*] Detected GraphCodeBERT in targets. Initializing Python DFG Extractor...")
+            self.analyzer = IdentifierAnalyzer(lang="python")
 
         for name, path in model_configs.items():
             print(f"\n[*] Loading Model[{name}] from {path}...")
@@ -133,23 +127,16 @@ class ModelZoo:
                     f"[!] CRITICAL: Target path {path} not found for model '{name}'. Aborting init.")
 
             try:
-                # [*] Loading Tokenizer (Fast Mode Enabled)...
                 tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=True)
                 adapter_config_path = os.path.join(path, "adapter_config.json")
 
                 if os.path.exists(adapter_config_path):
-                    # =========================================================
-                    # 🌟 完全照搬 test_graph.py 的成功逻辑
-                    # =========================================================
                     print(f"    |- Detected LoRA adapter. Parsing config...")
                     with open(adapter_config_path, 'r', encoding='utf-8') as f:
                         peft_config = json.load(f)
 
-                    # 提取 base_model 的名称
                     base_model_name = peft_config.get("base_model_name_or_path")
 
-                    # 容错机制：如果 adapter_config.json 里存的是之前电脑上的绝对死路径
-                    # 就根据当前模型的名字，强制推断回 HuggingFace 的线上基座名称
                     if not base_model_name or (not os.path.exists(base_model_name) and (
                             "/" in base_model_name or "\\" in base_model_name) and "microsoft" not in base_model_name):
                         name_lower = name.lower()
@@ -161,7 +148,6 @@ class ModelZoo:
                             base_model_name = "microsoft/codebert-base"
                         print(f"    |- [*] Auto-fallback to HF Hub: {base_model_name}")
 
-                    # [*] Loading Standard HF Classifier Skeleton...
                     print(f"    |- Loading Standard HF Classifier Skeleton from: {base_model_name}")
                     base_model = AutoModelForSequenceClassification.from_pretrained(
                         base_model_name,
@@ -170,15 +156,11 @@ class ModelZoo:
                         ignore_mismatched_sizes=True
                     )
 
-                    # [*] Loading LoRA Adapters and Classifier...
                     print(f"    |- Loading LoRA Adapters and Classifier from {path}...")
                     model = PeftModel.from_pretrained(base_model, path)
                     print("    |- ✅ LoRA weights and Custom Classifier successfully injected.")
 
                 else:
-                    # =========================================================
-                    # 兼容非 LoRA 模型的普通加载逻辑
-                    # =========================================================
                     print(f"    |- Loading standard HF classifier...")
                     model = AutoModelForSequenceClassification.from_pretrained(
                         path,
@@ -197,24 +179,17 @@ class ModelZoo:
                 import traceback
                 print("\n" + "=" * 50)
                 print(f"🚨 FAILED TO LOAD MODEL: {name}")
-                print(f"Path: {path}")
-                print("Error Traceback:")
                 traceback.print_exc()
                 print("=" * 50 + "\n")
                 raise RuntimeError(f"Failed to load model '{name}'. Execution halted.") from e
-
 
     def _encode_graphcodebert(self, code: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         code_bytes = code.encode('utf-8')
         dfg_nodes, dfg_to_code_chars, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
 
-        # ====================================================================
-        # 🌟 关键对齐：严格匹配训练脚本 GraphCodeBERTVulDataset 的硬编码长度
-        # ====================================================================
         args_code_length = 384
-        args_dfg_length = self.max_seq_len - args_code_length  # 128
+        args_dfg_length = self.max_seq_len - args_code_length
 
-        # 1. 截断图节点 (对齐训练集)
         dfg_nodes = dfg_nodes[:args_dfg_length]
         dfg_to_code_chars = dfg_to_code_chars[:args_dfg_length]
         dfg_to_dfg = [[e for e in edges if e < args_dfg_length] for edges in dfg_to_dfg[:args_dfg_length]]
@@ -222,7 +197,6 @@ class ModelZoo:
         if not getattr(tokenizer, "is_fast", False):
             raise RuntimeError("[!] 必须加载 Fast 版本的 Tokenizer！")
 
-        # 2. 文本截断必须锁定 384 (对齐训练集)
         encoded = tokenizer(
             code,
             truncation=True,
@@ -233,7 +207,6 @@ class ModelZoo:
         offsets = encoded['offset_mapping']
         text_len = len(text_ids)
 
-        # 3. 构建 Subwords 映射
         dfg_to_subwords = []
         for (start_char, end_char) in dfg_to_code_chars:
             subword_indices = []
@@ -243,18 +216,14 @@ class ModelZoo:
                     subword_indices.append(idx)
             dfg_to_subwords.append(subword_indices)
 
-        # 4. 组装 IDs
         input_ids = text_ids + [tokenizer.unk_token_id] * len(dfg_nodes)
         position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)] + [0] * len(dfg_nodes)
 
-        # 5. Padding
         pad_len = self.max_seq_len - len(input_ids)
         input_ids += [tokenizer.pad_token_id] * pad_len
         position_ids += [tokenizer.pad_token_id] * pad_len
 
-        # 6. 构建 Attention Mask
         attn_mask = np.zeros((self.max_seq_len, self.max_seq_len), dtype=np.bool_)
-
         attn_mask[:text_len, :text_len] = True
 
         for idx, token_id in enumerate(input_ids):
@@ -275,7 +244,6 @@ class ModelZoo:
                 attn_mask[matrix_dfg_idx, matrix_source_idx] = True
                 attn_mask[matrix_source_idx, matrix_dfg_idx] = True
 
-        # 7. 转换 4D Float 掩码
         float_mask = np.where(attn_mask, 0.0, -10000.0).astype(np.float32)
         float_mask_4d = np.expand_dims(float_mask, axis=(0, 1))
 
@@ -286,7 +254,6 @@ class ModelZoo:
         )
 
     def _encode_unixcoder(self, code: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
-        """为 UniXcoder 构建特征：强制注入 <encoder-only> 控制符"""
         tokens = tokenizer.tokenize(code)
         tokens = tokens[:self.max_seq_len - 4]
 
@@ -310,7 +277,8 @@ class ModelZoo:
     def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
         m = self.models.get(target_model)
         if m is None:
-            return [1.0, 0.0], -1
+            # 返回空概率向量和未知分类
+            return [0.0] * self.num_classes, -1
 
         tokenizer = m["tokenizer"]
         model = m["model"]
@@ -341,9 +309,6 @@ class ModelZoo:
             probs = torch.softmax(outputs.logits, dim=-1).squeeze(0).cpu().numpy().tolist()
             pred_label = int(np.argmax(probs))
 
-            if self.eval_mode == "binary" and pred_label == 0:
-                pred_label = -1
-
         return probs, pred_label
 
     def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
@@ -351,7 +316,7 @@ class ModelZoo:
         """安全的 Batch Predict: 兼容各种非标准架构的特征重组"""
         m = self.models.get(target_model)
         if m is None:
-            return [[1.0, 0.0]] * len(codes), [-1] * len(codes)
+            return [[0.0] * self.num_classes] * len(codes), [-1] * len(codes)
 
         tokenizer = m["tokenizer"]
         model = m["model"]
@@ -399,9 +364,6 @@ class ModelZoo:
                 probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
                 probs_list = probs.tolist() if probs.ndim == 2 else [probs.tolist()]
                 preds_list = [int(np.argmax(p)) for p in probs_list]
-
-                if self.eval_mode == "binary":
-                    preds_list = [1 if p == 1 else -1 for p in preds_list]
 
                 all_probs.extend(probs_list)
                 all_preds.extend(preds_list)
